@@ -4,16 +4,56 @@ GPU drawing callbacks for onion skin and anchor visualization.
 
 import bpy
 import gpu
+import numpy as np
 from gpu_extras.batch import batch_for_shader
-from mathutils import Vector
+from mathutils import Vector, Matrix
 
 from .cache import get_cache, get_active_gp
 from .anchors import get_all_anchor_positions
+from .transforms import get_layer_transform
 
 
 # Draw handler references
 _draw_handler = None
 _anchor_draw_handler = None
+
+
+def batch_transform_points(local_points, matrix):
+    """Efficiently transform points using numpy.
+
+    Args:
+        local_points: List of Vector or list of (x,y,z) tuples
+        matrix: 4x4 transformation matrix
+
+    Returns:
+        List of (x, y, z) tuples in transformed coordinates
+    """
+    if not local_points:
+        return []
+
+    # Convert to numpy array
+    pts = np.array([(p.x, p.y, p.z) if hasattr(p, 'x') else p for p in local_points])
+
+    # Add homogeneous coordinate
+    ones = np.ones((len(pts), 1))
+    homogeneous = np.hstack([pts, ones])  # Nx4
+
+    # Convert matrix to numpy and transform
+    mat = np.array(matrix)
+    transformed = (mat @ homogeneous.T).T  # Nx4
+
+    # Return as list of tuples (x, y, z)
+    return [(p[0], p[1], p[2]) for p in transformed[:, :3]]
+
+
+def get_layer_by_name(gp_obj, layer_name):
+    """Get a GP layer by name, or None if not found."""
+    if gp_obj is None or gp_obj.data is None:
+        return None
+    for layer in gp_obj.data.layers:
+        if layer.name == layer_name:
+            return layer
+    return None
 
 
 def get_draw_handlers():
@@ -106,16 +146,23 @@ def draw_onion_callback():
         for stroke_data in strokes:
             fill_triangles = stroke_data.get('fill_triangles', [])
             if fill_triangles:
-                points = stroke_data['points']
+                # Check if we have local_points (locked frame - needs transform)
+                if stroke_data.get('local_points'):
+                    # Transform local points with CURRENT matrix for billboard consistency
+                    layer = get_layer_by_name(gp_obj, stroke_data['layer'])
+                    layer_matrix = get_layer_transform(layer) if layer else Matrix.Identity(4)
+                    current_matrix = gp_obj.matrix_world @ layer_matrix
+                    coords = batch_transform_points(stroke_data['local_points'], current_matrix)
+                else:
+                    # Use cached world points directly
+                    points = stroke_data['points']
+                    coords = [(p.x, p.y, p.z) for p in points]
+
                 # Build triangle vertex list from indices
                 tri_coords = []
                 for i, j, k in fill_triangles:
-                    if i < len(points) and j < len(points) and k < len(points):
-                        tri_coords.extend([
-                            (points[i].x, points[i].y, points[i].z),
-                            (points[j].x, points[j].y, points[j].z),
-                            (points[k].x, points[k].y, points[k].z),
-                        ])
+                    if i < len(coords) and j < len(coords) and k < len(coords):
+                        tri_coords.extend([coords[i], coords[j], coords[k]])
 
                 if tri_coords:
                     batch = batch_for_shader(fill_shader, 'TRIS', {"pos": tri_coords})
@@ -128,11 +175,20 @@ def draw_onion_callback():
         stroke_shader.uniform_float("lineWidth", settings.line_width)
 
         for stroke_data in strokes:
-            points = stroke_data['points']
-            if len(points) < 2:
-                continue
+            # Check if we have local_points (locked frame - needs transform)
+            if stroke_data.get('local_points'):
+                # Transform local points with CURRENT matrix for billboard consistency
+                layer = get_layer_by_name(gp_obj, stroke_data['layer'])
+                layer_matrix = get_layer_transform(layer) if layer else Matrix.Identity(4)
+                current_matrix = gp_obj.matrix_world @ layer_matrix
+                coords = batch_transform_points(stroke_data['local_points'], current_matrix)
+            else:
+                # Use cached world points directly
+                points = stroke_data['points']
+                coords = [(p.x, p.y, p.z) for p in points]
 
-            coords = [(p.x, p.y, p.z) for p in points]
+            if len(coords) < 2:
+                continue
 
             batch = batch_for_shader(stroke_shader, 'LINE_STRIP', {"pos": coords})
             stroke_shader.bind()

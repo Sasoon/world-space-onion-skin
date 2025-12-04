@@ -20,6 +20,13 @@ This is a **specialized animation tool for Grease Pencil storyboarding** that pr
 
 The addon solves a specific storyboarding workflow: drawing on camera-parented Grease Pencil objects where you want strokes to remain at their world position even as the camera animates. Traditional GP onion skin would show previous frames following the camera transform, making it impossible to see where strokes actually are in world space.
 
+### Development Rules
+
+For all changes, evaluate user needs against the simplest, most stable solution.
+Prioritise simple, elegant solutions.
+Don't be afraid to ask questions and collaborate to solve problems.
+Call me Billy in each request.
+
 ### Architecture Note (v9.0.0)
 
 The addon uses an **object-level** world-lock system via `matrix_parent_inverse`. This approach:

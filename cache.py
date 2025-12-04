@@ -8,6 +8,7 @@ from mathutils import Vector
 from mathutils.geometry import tessellate_polygon
 
 from .transforms import get_layer_transform
+from .anchors import is_object_locked_at_frame
 
 
 def get_active_gp(context):
@@ -180,9 +181,12 @@ def extract_strokes_at_current_frame(gp_obj, settings):
             if start_idx >= end_idx:
                 continue
 
+            # Extract local and world points
+            local_points = []
             world_points = []
             for p_idx in range(start_idx, end_idx):
                 local_pos = Vector(pos_attr.data[p_idx].vector)
+                local_points.append(local_pos.copy())
                 world_pos = full_matrix @ local_pos
                 world_points.append(world_pos.copy())
 
@@ -201,12 +205,21 @@ def extract_strokes_at_current_frame(gp_obj, settings):
                 if has_fill and len(world_points) >= 3:
                     fill_triangles = triangulate_fill(world_points)
 
-                strokes_data.append({
+                # Check if this frame is world-locked
+                is_locked = is_object_locked_at_frame(gp_obj, active_kf.frame_number)
+
+                stroke_data = {
                     'points': world_points,
                     'layer': layer.name,
                     'frame': active_kf.frame_number,
                     'fill_triangles': fill_triangles,
-                })
+                }
+
+                # For locked frames, also store local points for billboard-consistent rendering
+                if is_locked:
+                    stroke_data['local_points'] = local_points
+
+                strokes_data.append(stroke_data)
     
     return strokes_data
 
