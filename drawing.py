@@ -342,34 +342,36 @@ def draw_motion_path_callback():
         return
 
     # Set up GPU state
-    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-
     gpu.state.blend_set('ALPHA')
     gpu.state.depth_test_set('LESS_EQUAL')
     gpu.state.depth_mask_set(False)
-    gpu.state.line_width_set(settings.motion_path_width)
 
     color = tuple(settings.motion_path_color)
+    region = bpy.context.region
 
-    # Draw the path line
-    batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": path_points})
-    shader.bind()
-    shader.uniform_float("color", color)
-    batch.draw(shader)
+    # Draw the path line using POLYLINE shader (supports line width)
+    line_shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+    line_shader.uniform_float("viewportSize", (region.width, region.height))
+    line_shader.uniform_float("lineWidth", settings.motion_path_width)
+
+    batch = batch_for_shader(line_shader, 'LINE_STRIP', {"pos": path_points})
+    line_shader.bind()
+    line_shader.uniform_float("color", color)
+    batch.draw(line_shader)
 
     # Draw points at each anchor if enabled
     if settings.motion_path_show_points:
+        point_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.point_size_set(8.0)
-        batch = batch_for_shader(shader, 'POINTS', {"pos": path_points})
-        shader.bind()
-        shader.uniform_float("color", color)
-        batch.draw(shader)
+        batch = batch_for_shader(point_shader, 'POINTS', {"pos": path_points})
+        point_shader.bind()
+        point_shader.uniform_float("color", color)
+        batch.draw(point_shader)
 
     # Reset GPU state
     gpu.state.blend_set('NONE')
     gpu.state.depth_test_set('NONE')
     gpu.state.depth_mask_set(True)
-    gpu.state.line_width_set(1.0)
 
 
 def register_draw_handlers():
