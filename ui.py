@@ -195,6 +195,14 @@ class WONION_PT_anchors(bpy.types.Panel):
             row.prop(settings, "timeline_lock_color", text="")
             row.prop(settings, "timeline_line_width", text="W")
 
+        # Motion path
+        row = layout.row(align=True)
+        row.prop(settings, "motion_path_enabled")
+        if settings.motion_path_enabled:
+            row.prop(settings, "motion_path_color", text="")
+            row.prop(settings, "motion_path_width", text="W")
+            layout.prop(settings, "motion_path_show_points")
+
         layout.separator()
 
         row = layout.row(align=True)

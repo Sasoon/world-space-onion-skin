@@ -8,12 +8,13 @@ from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 
 from .cache import get_cache, get_active_gp
-from .anchors import get_all_anchor_positions
+from .anchors import get_all_anchor_positions, get_all_locked_frames
 
 
 # Draw handler references
 _draw_handler = None
 _anchor_draw_handler = None
+_motion_path_handler = None
 
 
 def get_draw_handlers():
@@ -295,30 +296,110 @@ def draw_anchor_callback():
     gpu.state.line_width_set(1.0)
 
 
+def draw_motion_path_callback():
+    """
+    GPU draw callback - renders motion path connecting anchor positions.
+    Shows the trajectory of movement across locked frames.
+    """
+    try:
+        scene = bpy.context.scene
+    except (RuntimeError, AttributeError):
+        return
+
+    if not hasattr(scene, 'world_onion'):
+        return
+
+    settings = scene.world_onion
+
+    if not settings.enabled:
+        return
+
+    if not settings.motion_path_enabled:
+        return
+
+    # Get active GP object
+    gp_obj = get_active_gp(bpy.context)
+    if gp_obj is None:
+        return
+
+    # Get all locked frames with their anchor positions
+    locked_frames = get_all_locked_frames(gp_obj, include_data=True)
+
+    if len(locked_frames) < 2:
+        # Need at least 2 points to draw a path
+        return
+
+    # Sort by frame number and extract positions
+    sorted_frames = sorted(locked_frames.items(), key=lambda x: int(x[0]))
+
+    path_points = []
+    for frame_str, lock_data in sorted_frames:
+        if 'anchor_world' in lock_data:
+            pos = lock_data['anchor_world']
+            path_points.append((pos[0], pos[1], pos[2]))
+
+    if len(path_points) < 2:
+        return
+
+    # Set up GPU state
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+
+    gpu.state.blend_set('ALPHA')
+    gpu.state.depth_test_set('LESS_EQUAL')
+    gpu.state.depth_mask_set(False)
+    gpu.state.line_width_set(settings.motion_path_width)
+
+    color = tuple(settings.motion_path_color)
+
+    # Draw the path line
+    batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": path_points})
+    shader.bind()
+    shader.uniform_float("color", color)
+    batch.draw(shader)
+
+    # Draw points at each anchor if enabled
+    if settings.motion_path_show_points:
+        gpu.state.point_size_set(8.0)
+        batch = batch_for_shader(shader, 'POINTS', {"pos": path_points})
+        shader.bind()
+        shader.uniform_float("color", color)
+        batch.draw(shader)
+
+    # Reset GPU state
+    gpu.state.blend_set('NONE')
+    gpu.state.depth_test_set('NONE')
+    gpu.state.depth_mask_set(True)
+    gpu.state.line_width_set(1.0)
+
+
 def register_draw_handlers():
     """Register GPU draw handlers."""
-    global _draw_handler, _anchor_draw_handler
-    
+    global _draw_handler, _anchor_draw_handler, _motion_path_handler
+
     if _draw_handler is None:
         _draw_handler = bpy.types.SpaceView3D.draw_handler_add(
             draw_onion_callback, (), 'WINDOW', 'POST_VIEW'
         )
-    
+
     if _anchor_draw_handler is None:
         _anchor_draw_handler = bpy.types.SpaceView3D.draw_handler_add(
             draw_anchor_callback, (), 'WINDOW', 'POST_VIEW'
         )
 
+    if _motion_path_handler is None:
+        _motion_path_handler = bpy.types.SpaceView3D.draw_handler_add(
+            draw_motion_path_callback, (), 'WINDOW', 'POST_VIEW'
+        )
+
 
 def unregister_draw_handlers():
     """Unregister GPU draw handlers."""
-    global _draw_handler, _anchor_draw_handler
+    global _draw_handler, _anchor_draw_handler, _motion_path_handler
 
     if _draw_handler is not None:
         try:
             bpy.types.SpaceView3D.draw_handler_remove(_draw_handler, 'WINDOW')
         except ValueError:
-            # Handler already removed or not registered
             pass
         _draw_handler = None
 
@@ -326,6 +407,12 @@ def unregister_draw_handlers():
         try:
             bpy.types.SpaceView3D.draw_handler_remove(_anchor_draw_handler, 'WINDOW')
         except ValueError:
-            # Handler already removed or not registered
             pass
         _anchor_draw_handler = None
+
+    if _motion_path_handler is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_motion_path_handler, 'WINDOW')
+        except ValueError:
+            pass
+        _motion_path_handler = None

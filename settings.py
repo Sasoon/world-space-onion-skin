@@ -220,3 +220,35 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         default=3.0, min=1.0, max=10.0,
         update=update_setting,
     )
+
+    # Motion path properties
+    motion_path_enabled: bpy.props.BoolProperty(
+        name="Show Motion Path",
+        description="Draw a line connecting anchor positions across locked frames",
+        default=False,
+        update=update_setting,
+    )
+
+    motion_path_color: bpy.props.FloatVectorProperty(
+        name="Path Color",
+        description="Color of the motion path line",
+        subtype='COLOR',
+        size=4,
+        default=(0.2, 0.8, 1.0, 0.8),  # Cyan with alpha
+        min=0.0, max=1.0,
+        update=update_setting,
+    )
+
+    motion_path_width: bpy.props.FloatProperty(
+        name="Path Width",
+        description="Width of the motion path line",
+        default=2.0, min=1.0, max=10.0,
+        update=update_setting,
+    )
+
+    motion_path_show_points: bpy.props.BoolProperty(
+        name="Show Points",
+        description="Show dots at each anchor position along the path",
+        default=True,
+        update=update_setting,
+    )

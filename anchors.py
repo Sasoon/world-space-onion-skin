@@ -656,19 +656,32 @@ def find_visible_locked_frame(gp_obj, current_frame):
     return None
 
 
-def get_all_locked_frames(gp_obj):
-    """Get list of all frame numbers that are world-locked.
+def get_all_locked_frames(gp_obj, include_data=False):
+    """Get all world-locked frames.
 
-    Returns sorted list of frame numbers.
+    Args:
+        gp_obj: Grease Pencil object
+        include_data: If True, return dict {frame_str: lock_data}
+                      If False, return sorted list of frame numbers (default)
+
+    Returns:
+        If include_data=False: Sorted list of frame numbers
+        If include_data=True: Dict of {frame_str: lock_data} for locked frames
     """
     lock_data = get_object_lock_data(gp_obj)
 
-    locked_frames = []
-    for frame_str, data in lock_data.items():
-        if isinstance(data, dict) and data.get("world_locked", False):
-            locked_frames.append(int(frame_str))
-
-    return sorted(locked_frames)
+    if include_data:
+        return {
+            frame_str: data
+            for frame_str, data in lock_data.items()
+            if isinstance(data, dict) and data.get("world_locked", False)
+        }
+    else:
+        locked_frames = []
+        for frame_str, data in lock_data.items():
+            if isinstance(data, dict) and data.get("world_locked", False):
+                locked_frames.append(int(frame_str))
+        return sorted(locked_frames)
 
 
 def migrate_layer_locks_to_object_locks(gp_obj):
