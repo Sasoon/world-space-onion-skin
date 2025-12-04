@@ -6,11 +6,10 @@ import bpy
 import gpu
 import numpy as np
 from gpu_extras.batch import batch_for_shader
-from mathutils import Vector, Matrix
+from mathutils import Vector
 
 from .cache import get_cache, get_active_gp
 from .anchors import get_all_anchor_positions
-from .transforms import get_layer_transform
 
 
 # Draw handler references
@@ -18,42 +17,43 @@ _draw_handler = None
 _anchor_draw_handler = None
 
 
-def batch_transform_points(local_points, matrix):
-    """Efficiently transform points using numpy.
+def billboard_transform_points(local_points, world_points, current_matrix):
+    """Transform points to face current camera while keeping world position.
+
+    For 2.5D animation, onion skins should:
+    - Stay at their cached world position (where strokes were drawn)
+    - Rotate to face the current camera (billboard, for readability)
 
     Args:
-        local_points: List of Vector or list of (x,y,z) tuples
-        matrix: 4x4 transformation matrix
+        local_points: List of Vector - points in GP local space
+        world_points: List of Vector - cached world positions (for centroid)
+        current_matrix: 4x4 Matrix - current GP world matrix (has billboard rotation)
 
     Returns:
-        List of (x, y, z) tuples in transformed coordinates
+        List of (x, y, z) tuples in world coordinates
     """
     if not local_points:
         return []
 
-    # Convert to numpy array
-    pts = np.array([(p.x, p.y, p.z) if hasattr(p, 'x') else p for p in local_points])
+    # Convert to numpy
+    local_pts = np.array([(p.x, p.y, p.z) if hasattr(p, 'x') else p for p in local_points])
+    world_pts = np.array([(p.x, p.y, p.z) if hasattr(p, 'x') else p for p in world_points])
 
-    # Add homogeneous coordinate
-    ones = np.ones((len(pts), 1))
-    homogeneous = np.hstack([pts, ones])  # Nx4
+    # Compute centroids
+    local_centroid = np.mean(local_pts, axis=0)
+    world_centroid = np.mean(world_pts, axis=0)
 
-    # Convert matrix to numpy and transform
-    mat = np.array(matrix)
-    transformed = (mat @ homogeneous.T).T  # Nx4
+    # Get rotation from current matrix (3x3)
+    rot = np.array(current_matrix.to_3x3())
 
-    # Return as list of tuples (x, y, z)
-    return [(p[0], p[1], p[2]) for p in transformed[:, :3]]
+    # Compute local offsets from centroid
+    local_offsets = local_pts - local_centroid  # Nx3
 
+    # Rotate offsets and add to world centroid
+    rotated_offsets = (rot @ local_offsets.T).T  # Nx3
+    world_positions = world_centroid + rotated_offsets  # Nx3
 
-def get_layer_by_name(gp_obj, layer_name):
-    """Get a GP layer by name, or None if not found."""
-    if gp_obj is None or gp_obj.data is None:
-        return None
-    for layer in gp_obj.data.layers:
-        if layer.name == layer_name:
-            return layer
-    return None
+    return [(p[0], p[1], p[2]) for p in world_positions]
 
 
 def get_draw_handlers():
@@ -146,13 +146,14 @@ def draw_onion_callback():
         for stroke_data in strokes:
             fill_triangles = stroke_data.get('fill_triangles', [])
             if fill_triangles:
-                # Check if we have local_points (locked frame - needs transform)
+                # Check if we have local_points (locked frame - needs billboard transform)
                 if stroke_data.get('local_points'):
-                    # Transform local points with CURRENT matrix for billboard consistency
-                    layer = get_layer_by_name(gp_obj, stroke_data['layer'])
-                    layer_matrix = get_layer_transform(layer) if layer else Matrix.Identity(4)
-                    current_matrix = gp_obj.matrix_world @ layer_matrix
-                    coords = batch_transform_points(stroke_data['local_points'], current_matrix)
+                    # Billboard transform: position from cache, rotation from current camera
+                    coords = billboard_transform_points(
+                        stroke_data['local_points'],
+                        stroke_data['points'],  # World points for centroid
+                        gp_obj.matrix_world
+                    )
                 else:
                     # Use cached world points directly
                     points = stroke_data['points']
@@ -175,13 +176,14 @@ def draw_onion_callback():
         stroke_shader.uniform_float("lineWidth", settings.line_width)
 
         for stroke_data in strokes:
-            # Check if we have local_points (locked frame - needs transform)
+            # Check if we have local_points (locked frame - needs billboard transform)
             if stroke_data.get('local_points'):
-                # Transform local points with CURRENT matrix for billboard consistency
-                layer = get_layer_by_name(gp_obj, stroke_data['layer'])
-                layer_matrix = get_layer_transform(layer) if layer else Matrix.Identity(4)
-                current_matrix = gp_obj.matrix_world @ layer_matrix
-                coords = batch_transform_points(stroke_data['local_points'], current_matrix)
+                # Billboard transform: position from cache, rotation from current camera
+                coords = billboard_transform_points(
+                    stroke_data['local_points'],
+                    stroke_data['points'],  # World points for centroid
+                    gp_obj.matrix_world
+                )
             else:
                 # Use cached world points directly
                 points = stroke_data['points']
