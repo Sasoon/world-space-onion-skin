@@ -4,7 +4,6 @@ GPU drawing callbacks for onion skin and anchor visualization.
 
 import bpy
 import gpu
-import numpy as np
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 
@@ -15,45 +14,6 @@ from .anchors import get_all_anchor_positions
 # Draw handler references
 _draw_handler = None
 _anchor_draw_handler = None
-
-
-def billboard_transform_points(local_points, world_points, current_matrix):
-    """Transform points to face current camera while keeping world position.
-
-    For 2.5D animation, onion skins should:
-    - Stay at their cached world position (where strokes were drawn)
-    - Rotate to face the current camera (billboard, for readability)
-
-    Args:
-        local_points: List of Vector - points in GP local space
-        world_points: List of Vector - cached world positions (for centroid)
-        current_matrix: 4x4 Matrix - current GP world matrix (has billboard rotation)
-
-    Returns:
-        List of (x, y, z) tuples in world coordinates
-    """
-    if not local_points:
-        return []
-
-    # Convert to numpy
-    local_pts = np.array([(p.x, p.y, p.z) if hasattr(p, 'x') else p for p in local_points])
-    world_pts = np.array([(p.x, p.y, p.z) if hasattr(p, 'x') else p for p in world_points])
-
-    # Compute centroids
-    local_centroid = np.mean(local_pts, axis=0)
-    world_centroid = np.mean(world_pts, axis=0)
-
-    # Get rotation from current matrix (3x3)
-    rot = np.array(current_matrix.to_3x3())
-
-    # Compute local offsets from centroid
-    local_offsets = local_pts - local_centroid  # Nx3
-
-    # Rotate offsets and add to world centroid
-    rotated_offsets = (rot @ local_offsets.T).T  # Nx3
-    world_positions = world_centroid + rotated_offsets  # Nx3
-
-    return [(p[0], p[1], p[2]) for p in world_positions]
 
 
 def get_draw_handlers():
@@ -146,18 +106,9 @@ def draw_onion_callback():
         for stroke_data in strokes:
             fill_triangles = stroke_data.get('fill_triangles', [])
             if fill_triangles:
-                # Check if we have local_points (locked frame - needs billboard transform)
-                if stroke_data.get('local_points'):
-                    # Billboard transform: position from cache, rotation from current camera
-                    coords = billboard_transform_points(
-                        stroke_data['local_points'],
-                        stroke_data['points'],  # World points for centroid
-                        gp_obj.matrix_world
-                    )
-                else:
-                    # Use cached world points directly
-                    points = stroke_data['points']
-                    coords = [(p.x, p.y, p.z) for p in points]
+                # Use cached world points - shows true rendered orientation
+                points = stroke_data['points']
+                coords = [(p.x, p.y, p.z) for p in points]
 
                 # Build triangle vertex list from indices
                 tri_coords = []
@@ -176,18 +127,9 @@ def draw_onion_callback():
         stroke_shader.uniform_float("lineWidth", settings.line_width)
 
         for stroke_data in strokes:
-            # Check if we have local_points (locked frame - needs billboard transform)
-            if stroke_data.get('local_points'):
-                # Billboard transform: position from cache, rotation from current camera
-                coords = billboard_transform_points(
-                    stroke_data['local_points'],
-                    stroke_data['points'],  # World points for centroid
-                    gp_obj.matrix_world
-                )
-            else:
-                # Use cached world points directly
-                points = stroke_data['points']
-                coords = [(p.x, p.y, p.z) for p in points]
+            # Use cached world points - shows true rendered orientation
+            points = stroke_data['points']
+            coords = [(p.x, p.y, p.z) for p in points]
 
             if len(coords) < 2:
                 continue
