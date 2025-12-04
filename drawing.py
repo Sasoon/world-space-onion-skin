@@ -16,6 +16,17 @@ _draw_handler = None
 _anchor_draw_handler = None
 _motion_path_handler = None
 
+# Motion path cache
+_motion_path_cache = None  # List of (x, y, z) tuples
+_motion_path_cache_gp = None  # GP object the cache is for
+_motion_path_dirty = True
+
+
+def invalidate_motion_path():
+    """Mark motion path cache as dirty, triggering rebuild on next draw."""
+    global _motion_path_dirty
+    _motion_path_dirty = True
+
 
 def get_draw_handlers():
     """Get current draw handler references."""
@@ -296,11 +307,78 @@ def draw_anchor_callback():
     gpu.state.line_width_set(1.0)
 
 
+def catmull_rom_spline(points, subdivisions):
+    """Generate smooth curve through points using Catmull-Rom interpolation.
+
+    Args:
+        points: List of (x, y, z) tuples - control points
+        subdivisions: Number of subdivisions between each pair of points
+
+    Returns:
+        List of (x, y, z) tuples - smoothed curve points
+    """
+    if len(points) < 2:
+        return points
+
+    if subdivisions <= 0:
+        return points
+
+    result = []
+
+    # For Catmull-Rom, we need 4 points: p0, p1, p2, p3
+    # We interpolate between p1 and p2
+    # For endpoints, duplicate first/last points
+
+    n = len(points)
+    for i in range(n - 1):
+        # Get 4 control points (duplicate at boundaries)
+        p0 = points[max(0, i - 1)]
+        p1 = points[i]
+        p2 = points[min(n - 1, i + 1)]
+        p3 = points[min(n - 1, i + 2)]
+
+        # Add the starting point
+        if i == 0:
+            result.append(p1)
+
+        # Interpolate between p1 and p2
+        for j in range(1, subdivisions + 1):
+            t = j / (subdivisions + 1)
+            t2 = t * t
+            t3 = t2 * t
+
+            # Catmull-Rom matrix coefficients
+            x = 0.5 * ((2 * p1[0]) +
+                      (-p0[0] + p2[0]) * t +
+                      (2*p0[0] - 5*p1[0] + 4*p2[0] - p3[0]) * t2 +
+                      (-p0[0] + 3*p1[0] - 3*p2[0] + p3[0]) * t3)
+
+            y = 0.5 * ((2 * p1[1]) +
+                      (-p0[1] + p2[1]) * t +
+                      (2*p0[1] - 5*p1[1] + 4*p2[1] - p3[1]) * t2 +
+                      (-p0[1] + 3*p1[1] - 3*p2[1] + p3[1]) * t3)
+
+            z = 0.5 * ((2 * p1[2]) +
+                      (-p0[2] + p2[2]) * t +
+                      (2*p0[2] - 5*p1[2] + 4*p2[2] - p3[2]) * t2 +
+                      (-p0[2] + 3*p1[2] - 3*p2[2] + p3[2]) * t3)
+
+            result.append((x, y, z))
+
+        # Add endpoint of this segment
+        result.append(p2)
+
+    return result
+
+
 def draw_motion_path_callback():
     """
     GPU draw callback - renders motion path connecting anchor positions.
     Shows the trajectory of movement across locked frames.
+    Uses caching for performance - only rebuilds when invalidated.
     """
+    global _motion_path_cache, _motion_path_cache_gp, _motion_path_dirty
+
     try:
         scene = bpy.context.scene
     except (RuntimeError, AttributeError):
@@ -322,24 +400,40 @@ def draw_motion_path_callback():
     if gp_obj is None:
         return
 
-    # Get all locked frames with their anchor positions
-    locked_frames = get_all_locked_frames(gp_obj, include_data=True)
+    # Check if cache needs rebuild (dirty or different GP object)
+    if _motion_path_dirty or _motion_path_cache is None or _motion_path_cache_gp != gp_obj:
+        # Rebuild cache
+        locked_frames = get_all_locked_frames(gp_obj, include_data=True)
 
-    if len(locked_frames) < 2:
-        # Need at least 2 points to draw a path
+        if len(locked_frames) < 2:
+            _motion_path_cache = None
+            _motion_path_cache_gp = gp_obj
+            _motion_path_dirty = False
+            return
+
+        # Sort by frame number and extract positions
+        sorted_frames = sorted(locked_frames.items(), key=lambda x: int(x[0]))
+
+        path_points = []
+        for frame_str, lock_data in sorted_frames:
+            if 'anchor_world' in lock_data:
+                pos = lock_data['anchor_world']
+                path_points.append((pos[0], pos[1], pos[2]))
+
+        _motion_path_cache = path_points if len(path_points) >= 2 else None
+        _motion_path_cache_gp = gp_obj
+        _motion_path_dirty = False
+
+    path_points = _motion_path_cache
+    if path_points is None or len(path_points) < 2:
         return
 
-    # Sort by frame number and extract positions
-    sorted_frames = sorted(locked_frames.items(), key=lambda x: int(x[0]))
-
-    path_points = []
-    for frame_str, lock_data in sorted_frames:
-        if 'anchor_world' in lock_data:
-            pos = lock_data['anchor_world']
-            path_points.append((pos[0], pos[1], pos[2]))
-
-    if len(path_points) < 2:
-        return
+    # Apply smoothing if enabled
+    smoothing = settings.motion_path_smoothing
+    if smoothing > 0:
+        draw_points = catmull_rom_spline(path_points, smoothing)
+    else:
+        draw_points = path_points
 
     # Set up GPU state
     gpu.state.blend_set('ALPHA')
@@ -354,12 +448,12 @@ def draw_motion_path_callback():
     line_shader.uniform_float("viewportSize", (region.width, region.height))
     line_shader.uniform_float("lineWidth", settings.motion_path_width)
 
-    batch = batch_for_shader(line_shader, 'LINE_STRIP', {"pos": path_points})
+    batch = batch_for_shader(line_shader, 'LINE_STRIP', {"pos": draw_points})
     line_shader.bind()
     line_shader.uniform_float("color", color)
     batch.draw(line_shader)
 
-    # Draw points at each anchor if enabled
+    # Draw points at each anchor if enabled (use original points, not smoothed)
     if settings.motion_path_show_points:
         point_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.point_size_set(8.0)

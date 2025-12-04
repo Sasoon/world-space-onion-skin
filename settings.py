@@ -252,3 +252,18 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         default=True,
         update=update_setting,
     )
+
+    motion_path_smoothing: bpy.props.IntProperty(
+        name="Smoothing",
+        description="Subdivisions for smooth curves (0=sharp, higher=smoother)",
+        default=0, min=0, max=10,
+        update=update_setting,
+    )
+
+    # Interpolation properties
+    interpolation_enabled: bpy.props.BoolProperty(
+        name="Interpolate Positions",
+        description="Interpolate GP position between locked frames. Uses GP keyframe type (T key): Breakdown=Linear, Moving Hold=Bezier",
+        default=False,
+        update=update_setting,
+    )

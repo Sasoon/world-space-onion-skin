@@ -21,8 +21,10 @@ from .anchors import (
     set_lock_for_frame,
     find_visible_locked_frame,
     migrate_object_lock_frame,
+    get_interpolated_position,
 )
 from .transforms import align_canvas_to_cursor, get_camera_direction
+from .drawing import invalidate_motion_path
 
 
 # Global tracking state
@@ -30,6 +32,7 @@ _last_keyframe_set = set()
 _last_active_layer_name = None
 _last_active_gp = None  # Track active GP object for change detection
 _in_depsgraph_handler = False  # Prevent recursive handler calls
+_settings_logged = False  # Only log settings once per session
 
 
 def get_last_keyframe_set():
@@ -136,6 +139,7 @@ def apply_object_world_lock_for_frame(gp_obj, scene):
     """Determine which lock applies at current frame and apply it.
 
     Uses pivot-based billboard rotation around the anchor point.
+    Supports interpolation between locked frames when enabled.
 
     Args:
         gp_obj: The GP object to process
@@ -145,6 +149,7 @@ def apply_object_world_lock_for_frame(gp_obj, scene):
         return
 
     current_frame = scene.frame_current
+    settings = scene.world_onion
 
     # Find which locked frame is visible
     locked_frame = find_visible_locked_frame(gp_obj, current_frame)
@@ -153,12 +158,27 @@ def apply_object_world_lock_for_frame(gp_obj, scene):
         # Get lock data for this frame
         lock_data = get_lock_for_frame(gp_obj, locked_frame)
         if lock_data and "anchor_world" in lock_data and "anchor_local_offset" in lock_data and "matrix_local" in lock_data:
+            # Check if interpolation is enabled
+            anchor_world = lock_data["anchor_world"]
+            anchor_local_offset = lock_data["anchor_local_offset"]
+            matrix_local = lock_data["matrix_local"]
+
+            if settings.interpolation_enabled:
+                # Try to get interpolated position
+                interp_pos, interp_info = get_interpolated_position(gp_obj, current_frame)
+                if interp_pos is not None and interp_info is not None:
+                    # Use interpolated position and data from the interpolation's prev frame
+                    anchor_world = [interp_pos.x, interp_pos.y, interp_pos.z]
+                    prev_data = interp_info['prev_data']
+                    anchor_local_offset = prev_data["anchor_local_offset"]
+                    matrix_local = prev_data["matrix_local"]
+
             # Apply world lock with pivot-based billboard effect
             apply_world_lock_from_stored(
                 gp_obj,
-                lock_data["anchor_world"],
-                lock_data["anchor_local_offset"],
-                lock_data["matrix_local"]
+                anchor_world,
+                anchor_local_offset,
+                matrix_local
             )
             return
 
@@ -192,6 +212,15 @@ def on_frame_change(scene):
     if not settings.enabled:
         return
 
+    # Log settings once per session for debugging
+    global _settings_logged
+    if not _settings_logged:
+        print(f"[SETTINGS] interpolation_enabled={settings.interpolation_enabled}, "
+              f"anchor_enabled={settings.anchor_enabled}, "
+              f"anchor_auto_cursor={settings.anchor_auto_cursor}, "
+              f"motion_path_enabled={settings.motion_path_enabled}")
+        _settings_logged = True
+
     # === OBJECT-LEVEL WORLD LOCK ===
     # Apply to ALL GP objects with world locks (not just active)
     # This ensures locks work even when GP object isn't selected
@@ -200,6 +229,23 @@ def on_frame_change(scene):
 
     # Get active GP object for cache/anchor features
     gp_obj = get_active_gp(bpy.context)
+
+    # Track if we handled cursor via interpolation (to skip normal anchor cursor)
+    cursor_handled_by_interpolation = False
+
+    # === CURSOR/CANVAS INTERPOLATION (active GP only) ===
+    # Move cursor to interpolated position when scrubbing between locked frames
+    if gp_obj is not None and settings.interpolation_enabled and settings.anchor_enabled and settings.anchor_auto_cursor:
+        interp_pos, interp_info = get_interpolated_position(gp_obj, scene.frame_current)
+        if interp_pos is not None and interp_info is not None:
+            # We're interpolating between frames - move cursor to interpolated position
+            scene.cursor.location = interp_pos.copy()
+            print(f"[CURSOR] Interpolating cursor to {interp_pos}")
+            cursor_handled_by_interpolation = True
+            try:
+                align_canvas_to_cursor(bpy.context)
+            except (RuntimeError, AttributeError):
+                pass
 
     if gp_obj is None:
         return
@@ -210,7 +256,8 @@ def on_frame_change(scene):
         _last_keyframe_set = get_current_keyframes_set(gp_obj, settings)
         
         # Auto-move cursor to anchor position (active layer only)
-        if settings.anchor_auto_cursor:
+        # Skip if cursor was already set by interpolation
+        if settings.anchor_auto_cursor and not cursor_handled_by_interpolation:
             active_layer = gp_obj.data.layers.active
             if active_layer is not None:
                 current_frame = scene.frame_current
@@ -247,6 +294,11 @@ def on_frame_change(scene):
 
     # === ONION SKIN CACHE ===
     cache_current_frame(gp_obj, settings)
+
+    # === MOTION PATH ===
+    # Invalidate on every frame change so it stays fresh
+    if settings.motion_path_enabled:
+        invalidate_motion_path()
 
     # Request viewport redraw
     try:
@@ -480,6 +532,7 @@ def _on_depsgraph_update_impl(scene, depsgraph):
 
                                     matrix_local = gp_obj.matrix_local.copy()
                                     original_mpi = gp_obj.matrix_parent_inverse.copy()
+                                    print(f"[INHERIT] Auto-locking new frame {frame_num}")
                                     set_lock_for_frame(gp_obj, frame_num, anchor_world, anchor_local_offset, original_mpi, matrix_local)
 
         # Update tracking set

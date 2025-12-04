@@ -538,6 +538,20 @@ def set_object_lock_data(gp_obj, data):
         return
     gp_obj["world_onion_locks"] = json.dumps(data)
 
+    # Invalidate motion path cache (late import to avoid circular dependency)
+    from .drawing import invalidate_motion_path
+    print(f"[LOCK] Lock data changed. Frames: {list(data.keys())}")
+    invalidate_motion_path()
+
+    # Trigger viewport redraw so motion path updates visually
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+    except (RuntimeError, AttributeError):
+        pass
+
 
 def is_object_locked_at_frame(gp_obj, frame):
     """Check if a specific frame is world-locked at the object level.
@@ -573,13 +587,16 @@ def get_lock_for_frame(gp_obj, frame):
 
 
 def set_lock_for_frame(gp_obj, frame, anchor_world, anchor_local_offset,
-                       original_parent_inverse=None, matrix_local_at_lock=None):
+                       original_parent_inverse=None, matrix_local_at_lock=None,
+                       interpolation='CONSTANT'):
     """Set world lock for a specific frame with pivot-based billboard.
 
     anchor_world: Vector - world position of anchor (stroke center) that stays fixed
     anchor_local_offset: Vector - offset from GP origin to anchor in GP local coordinates
     original_parent_inverse: Matrix - original matrix_parent_inverse for restore on unlock
     matrix_local_at_lock: Matrix (4x4) - the matrix_local at lock time
+    interpolation: str - interpolation type for transitions TO this frame
+                   ('CONSTANT', 'LINEAR', 'BEZIER')
     """
     lock_data = get_object_lock_data(gp_obj)
     frame_str = str(frame)
@@ -590,6 +607,8 @@ def set_lock_for_frame(gp_obj, frame, anchor_world, anchor_local_offset,
         "anchor_world": [anchor_world[0], anchor_world[1], anchor_world[2]],
         # Offset from GP origin to anchor in local coordinates (for pivot rotation)
         "anchor_local_offset": [anchor_local_offset[0], anchor_local_offset[1], anchor_local_offset[2]],
+        # Interpolation type for position transitions TO this frame
+        "interpolation": interpolation,
     }
 
     if original_parent_inverse is not None:
@@ -682,6 +701,209 @@ def get_all_locked_frames(gp_obj, include_data=False):
             if isinstance(data, dict) and data.get("world_locked", False):
                 locked_frames.append(int(frame_str))
         return sorted(locked_frames)
+
+
+def get_keyframe_interpolation_type(gp_obj, frame_number):
+    """Get interpolation type from GP keyframe's keyframe_type property.
+
+    Maps GP keyframe types to interpolation:
+    - KEYFRAME, EXTREME, JITTER → CONSTANT (hold position)
+    - BREAKDOWN → LINEAR (transitional)
+    - MOVING_HOLD → BEZIER (smooth ease)
+
+    Returns 'CONSTANT', 'LINEAR', or 'BEZIER'.
+    """
+    if gp_obj is None or gp_obj.data is None:
+        return 'CONSTANT'
+
+    # Check all layers for a keyframe at this frame
+    for layer in gp_obj.data.layers:
+        for kf in layer.frames:
+            if kf.frame_number == frame_number:
+                # Try different possible attribute names
+                kf_type = None
+                for attr_name in ['keyframe_type', 'type', 'key_type']:
+                    if hasattr(kf, attr_name):
+                        kf_type = getattr(kf, attr_name)
+                        break
+
+                if kf_type is None:
+                    return 'CONSTANT'
+
+                # Map keyframe_type to interpolation
+                if kf_type == 'BREAKDOWN':
+                    return 'LINEAR'
+                elif kf_type == 'MOVING_HOLD':
+                    return 'BEZIER'
+                else:
+                    return 'CONSTANT'
+
+    return 'CONSTANT'
+
+
+def catmull_rom_point(p0, p1, p2, p3, t):
+    """Calculate a point on a Catmull-Rom spline.
+
+    Args:
+        p0, p1, p2, p3: Four control points (Vector or tuple)
+        t: Parameter 0-1, interpolates between p1 and p2
+
+    Returns:
+        Vector - interpolated point
+    """
+    t2 = t * t
+    t3 = t2 * t
+
+    x = 0.5 * ((2 * p1[0]) +
+              (-p0[0] + p2[0]) * t +
+              (2*p0[0] - 5*p1[0] + 4*p2[0] - p3[0]) * t2 +
+              (-p0[0] + 3*p1[0] - 3*p2[0] + p3[0]) * t3)
+
+    y = 0.5 * ((2 * p1[1]) +
+              (-p0[1] + p2[1]) * t +
+              (2*p0[1] - 5*p1[1] + 4*p2[1] - p3[1]) * t2 +
+              (-p0[1] + 3*p1[1] - 3*p2[1] + p3[1]) * t3)
+
+    z = 0.5 * ((2 * p1[2]) +
+              (-p0[2] + p2[2]) * t +
+              (2*p0[2] - 5*p1[2] + 4*p2[2] - p3[2]) * t2 +
+              (-p0[2] + 3*p1[2] - 3*p2[2] + p3[2]) * t3)
+
+    return Vector((x, y, z))
+
+
+def get_interpolated_position(gp_obj, frame):
+    """Get world position for GP at given frame, with interpolation between locked frames.
+
+    Reads interpolation type from GP keyframe's keyframe_type property (set via T key in timeline).
+    Uses Catmull-Rom spline if motion_path_smoothing > 0 for smooth curves through all points.
+
+    Returns:
+        (position, interpolation_data) where:
+        - position: Vector or None - the interpolated world position
+        - interpolation_data: dict or None - contains prev/next frame info for billboard calc
+            {'prev_frame': int, 'next_frame': int, 't': float, 'prev_data': dict, 'next_data': dict}
+
+    If exactly on a locked frame or using CONSTANT interpolation, returns (position, None).
+    """
+    locked = get_all_locked_frames(gp_obj, include_data=True)
+    if not locked:
+        return None, None
+
+    sorted_frames = sorted(locked.keys(), key=int)
+
+    # Find surrounding locked frames and their index
+    prev_frame = None
+    next_frame = None
+    prev_idx = -1
+    for i, f in enumerate(sorted_frames):
+        if int(f) <= frame:
+            prev_frame = f
+            prev_idx = i
+        if int(f) > frame and next_frame is None:
+            next_frame = f
+            break
+
+    if prev_frame is None:
+        return None, None  # Before first locked frame
+
+    prev_data = locked[prev_frame]
+    prev_pos = Vector(prev_data['anchor_world'])
+
+    if next_frame is None or int(prev_frame) == frame:
+        # At or after last locked frame, or exactly on a locked frame
+        return prev_pos, None
+
+    next_data = locked[next_frame]
+    next_pos = Vector(next_data['anchor_world'])
+
+    # Get interpolation type from the NEXT keyframe's keyframe_type
+    # (defines how we transition TO that keyframe)
+    interp_type = get_keyframe_interpolation_type(gp_obj, int(next_frame))
+
+    if interp_type == 'CONSTANT':
+        return prev_pos, None
+
+    # Calculate interpolation factor
+    t = (frame - int(prev_frame)) / (int(next_frame) - int(prev_frame))
+
+    # Check if smoothing is enabled
+    smoothing = 0
+    try:
+        smoothing = bpy.context.scene.world_onion.motion_path_smoothing
+    except (AttributeError, RuntimeError):
+        pass
+
+    if smoothing > 0 and len(sorted_frames) >= 2:
+        # Use Catmull-Rom spline for smooth interpolation
+        # Get 4 control points (duplicate at boundaries)
+        n = len(sorted_frames)
+        p0_idx = max(0, prev_idx - 1)
+        p1_idx = prev_idx
+        p2_idx = min(n - 1, prev_idx + 1)
+        p3_idx = min(n - 1, prev_idx + 2)
+
+        p0 = Vector(locked[sorted_frames[p0_idx]]['anchor_world'])
+        p1 = prev_pos
+        p2 = next_pos
+        p3 = Vector(locked[sorted_frames[p3_idx]]['anchor_world'])
+
+        pos = catmull_rom_point(p0, p1, p2, p3, t)
+    elif interp_type == 'LINEAR':
+        pos = prev_pos.lerp(next_pos, t)
+    elif interp_type == 'BEZIER':
+        # Smooth ease in/out using smoothstep
+        smooth_t = t * t * (3 - 2 * t)
+        pos = prev_pos.lerp(next_pos, smooth_t)
+    else:
+        pos = prev_pos
+
+    interp_info = {
+        'prev_frame': int(prev_frame),
+        'next_frame': int(next_frame),
+        't': t,
+        'prev_data': prev_data,
+        'next_data': next_data,
+    }
+
+    return pos, interp_info
+
+
+def set_interpolation_for_frame(gp_obj, frame, interpolation):
+    """Set the interpolation type for a specific locked frame.
+
+    interpolation: 'CONSTANT', 'LINEAR', or 'BEZIER'
+    """
+    lock_data = get_object_lock_data(gp_obj)
+    frame_str = str(frame)
+
+    if frame_str not in lock_data:
+        return False
+
+    if not isinstance(lock_data[frame_str], dict):
+        return False
+
+    lock_data[frame_str]['interpolation'] = interpolation
+    set_object_lock_data(gp_obj, lock_data)
+    return True
+
+
+def get_interpolation_for_frame(gp_obj, frame):
+    """Get the interpolation type for a specific locked frame.
+
+    Returns 'CONSTANT', 'LINEAR', 'BEZIER', or None if frame not locked.
+    """
+    lock_data = get_object_lock_data(gp_obj)
+    frame_str = str(frame)
+
+    if frame_str not in lock_data:
+        return None
+
+    data = lock_data[frame_str]
+    if not isinstance(data, dict) or not data.get('world_locked', False):
+        return None
+
+    return data.get('interpolation', 'CONSTANT')
 
 
 def migrate_layer_locks_to_object_locks(gp_obj):

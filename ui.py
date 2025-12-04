@@ -201,7 +201,14 @@ class WONION_PT_anchors(bpy.types.Panel):
         if settings.motion_path_enabled:
             row.prop(settings, "motion_path_color", text="")
             row.prop(settings, "motion_path_width", text="W")
-            layout.prop(settings, "motion_path_show_points")
+            row = layout.row(align=True)
+            row.prop(settings, "motion_path_show_points")
+            row.prop(settings, "motion_path_smoothing")
+
+        layout.separator()
+
+        # Interpolation between locked frames (uses GP keyframe type: T key)
+        layout.prop(settings, "interpolation_enabled")
 
         layout.separator()
 
