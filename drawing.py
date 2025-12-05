@@ -8,7 +8,7 @@ from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 
 from .cache import get_cache, get_active_gp
-from .anchors import get_all_anchor_positions, get_all_locked_frames
+from .anchors import get_all_anchor_positions, get_all_locked_frames, get_lock_for_frame, get_interpolated_position
 
 
 # Draw handler references
@@ -91,6 +91,37 @@ def draw_onion_callback():
         if not strokes:
             continue
 
+        # Compute offset to position strokes correctly
+        offset = Vector((0, 0, 0))
+
+        # Check if this frame is locked (has reliable anchor position)
+        lock_data = get_lock_for_frame(gp_obj, frame)
+
+        # When interpolation is enabled, ONLY show locked frames
+        # (in-between frames have unreliable cached positions)
+        if settings.interpolation_enabled:
+            if not lock_data or 'anchor_world' not in lock_data:
+                # Not a locked frame - skip it
+                continue
+
+        # Compute centroid of cached strokes (needed for offset calculation)
+        all_points = []
+        for stroke_data in strokes:
+            all_points.extend(stroke_data['points'])
+
+        if not all_points:
+            continue
+
+        centroid = Vector((0, 0, 0))
+        for p in all_points:
+            centroid += p
+        centroid /= len(all_points)
+
+        # Offset locked frames to their anchor position
+        if lock_data and 'anchor_world' in lock_data:
+            anchor_world = Vector(lock_data['anchor_world'])
+            offset = anchor_world - centroid
+
         # Calculate color based on before/after
         if frame < current_frame:
             base_color = settings.color_before
@@ -118,9 +149,9 @@ def draw_onion_callback():
         for stroke_data in strokes:
             fill_triangles = stroke_data.get('fill_triangles', [])
             if fill_triangles:
-                # Use cached world points - shows true rendered orientation
+                # Apply offset for locked frames
                 points = stroke_data['points']
-                coords = [(p.x, p.y, p.z) for p in points]
+                coords = [(p.x + offset.x, p.y + offset.y, p.z + offset.z) for p in points]
 
                 # Build triangle vertex list from indices
                 tri_coords = []
@@ -139,9 +170,9 @@ def draw_onion_callback():
         stroke_shader.uniform_float("lineWidth", settings.line_width)
 
         for stroke_data in strokes:
-            # Use cached world points - shows true rendered orientation
+            # Apply offset for locked frames
             points = stroke_data['points']
-            coords = [(p.x, p.y, p.z) for p in points]
+            coords = [(p.x + offset.x, p.y + offset.y, p.z + offset.z) for p in points]
 
             if len(coords) < 2:
                 continue
