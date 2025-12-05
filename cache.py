@@ -217,20 +217,17 @@ def extract_strokes_at_current_frame(gp_obj, settings):
 def cache_current_frame(gp_obj, settings):
     """Cache strokes for the current frame.
 
-    In KEYFRAMES mode with interpolation, skip caching non-keyframes to avoid
-    storing strokes at interpolated positions (locked frames get offset at draw time).
-    In FRAMES mode, cache everything so "Every Frame" onion skin works.
+    In KEYFRAMES mode with interpolation, skip caching non-keyframes.
+    Drawing code computes offset from cached stroke positions to motion path.
     """
     global _cache
     frame = bpy.context.scene.frame_current
 
-    # In KEYFRAMES mode with interpolation, only cache actual keyframes
-    # (locked frames will be offset to anchor position when drawing)
+    # In KEYFRAMES mode with interpolation, skip caching non-keyframes
     if settings.mode == 'KEYFRAMES' and settings.interpolation_enabled:
         from .anchors import get_interpolated_position
         _, interp_info = get_interpolated_position(gp_obj, frame)
         if interp_info is not None:
-            # We're interpolating between keyframes - don't cache
             return
 
     strokes = extract_strokes_at_current_frame(gp_obj, settings)

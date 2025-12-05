@@ -91,36 +91,35 @@ def draw_onion_callback():
         if not strokes:
             continue
 
-        # Compute offset to position strokes correctly
+        # Compute offset to position strokes correctly on motion path
         offset = Vector((0, 0, 0))
 
-        # Check if this frame is locked (has reliable anchor position)
-        lock_data = get_lock_for_frame(gp_obj, frame)
-
-        # When interpolation is enabled, ONLY show locked frames
-        # (in-between frames have unreliable cached positions)
+        # Check if interpolation is enabled - use motion path positions
         if settings.interpolation_enabled:
-            if not lock_data or 'anchor_world' not in lock_data:
-                # Not a locked frame - skip it
+            # Get current position on motion path for this frame
+            interp_pos, interp_info = get_interpolated_position(gp_obj, frame)
+
+            if interp_pos is None:
+                # Frame is outside locked range - skip it
                 continue
 
-        # Compute centroid of cached strokes (needed for offset calculation)
-        all_points = []
-        for stroke_data in strokes:
-            all_points.extend(stroke_data['points'])
+            # Compute anchor position of cached strokes (center X/Y, min Z)
+            all_points = []
+            for stroke_data in strokes:
+                all_points.extend(stroke_data['points'])
 
-        if not all_points:
-            continue
+            if all_points:
+                sum_x, sum_y = 0.0, 0.0
+                min_z = float('inf')
+                for p in all_points:
+                    sum_x += p.x
+                    sum_y += p.y
+                    min_z = min(min_z, p.z)
+                n = len(all_points)
+                cached_anchor = Vector((sum_x / n, sum_y / n, min_z))
 
-        centroid = Vector((0, 0, 0))
-        for p in all_points:
-            centroid += p
-        centroid /= len(all_points)
-
-        # Offset locked frames to their anchor position
-        if lock_data and 'anchor_world' in lock_data:
-            anchor_world = Vector(lock_data['anchor_world'])
-            offset = anchor_world - centroid
+                # Offset from cached anchor to motion path position
+                offset = interp_pos - cached_anchor
 
         # Calculate color based on before/after
         if frame < current_frame:
