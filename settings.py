@@ -256,7 +256,7 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
     motion_path_smoothing: bpy.props.IntProperty(
         name="Smoothing",
         description="Subdivisions for smooth curves (0=sharp, higher=smoother)",
-        default=0, min=0, max=10,
+        default=0, min=0, max=200,
         update=update_setting,
     )
 

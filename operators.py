@@ -20,9 +20,11 @@ from .anchors import (
     get_lock_for_frame,
     set_lock_for_frame,
     remove_lock_for_frame,
+    update_lock_anchor,
 )
 from .transforms import get_layer_transform, get_camera_direction
 from .handlers import apply_object_world_lock_for_frame, reset_object_world_lock, apply_world_lock_from_stored
+from .drawing import invalidate_motion_path
 
 
 class WONION_OT_clear_cache(bpy.types.Operator):
@@ -159,14 +161,34 @@ class WONION_OT_set_anchor(bpy.types.Operator):
         cam_dir = get_camera_direction(scene)
 
         set_anchor_for_frame(gp_obj, active_layer.name, active_kf.frame_number, cursor_pos, cam_dir)
-        
-        self.report({'INFO'}, f"Anchor set at frame {active_kf.frame_number}")
-        
+
+        # Calculate anchor_local_offset
+        gp_origin_world = gp_obj.matrix_world.to_translation()
+        offset_world = cursor_pos - gp_origin_world
+        anchor_local_offset = gp_obj.matrix_world.to_3x3().inverted() @ offset_world
+
+        # Lock the frame (or update if already locked)
+        if is_object_locked_at_frame(gp_obj, active_kf.frame_number):
+            update_lock_anchor(gp_obj, active_kf.frame_number, cursor_pos, anchor_local_offset)
+        else:
+            # Lock the frame at this position
+            matrix_local = gp_obj.matrix_local.copy()
+            original_mpi = gp_obj.matrix_parent_inverse.copy()
+            set_lock_for_frame(gp_obj, active_kf.frame_number, cursor_pos, anchor_local_offset, original_mpi, matrix_local)
+
+        # Apply world lock with new anchor
+        apply_object_world_lock_for_frame(gp_obj, scene)
+
+        # Invalidate motion path so it updates
+        invalidate_motion_path()
+
+        self.report({'INFO'}, f"Anchor set and locked at frame {active_kf.frame_number}")
+
         # Redraw
         for area in context.screen.areas:
             if area.type == 'VIEW_3D':
                 area.tag_redraw()
-        
+
         return {'FINISHED'}
 
 
@@ -219,16 +241,36 @@ class WONION_OT_auto_anchor(bpy.types.Operator):
 
         set_anchor_for_frame(gp_obj, active_layer.name, active_kf.frame_number, anchor_pos, cam_dir)
 
+        # Calculate anchor_local_offset
+        gp_origin_world = gp_obj.matrix_world.to_translation()
+        offset_world = anchor_pos - gp_origin_world
+        anchor_local_offset = gp_obj.matrix_world.to_3x3().inverted() @ offset_world
+
+        # Lock the frame (or update if already locked)
+        if is_object_locked_at_frame(gp_obj, active_kf.frame_number):
+            update_lock_anchor(gp_obj, active_kf.frame_number, anchor_pos, anchor_local_offset)
+        else:
+            # Lock the frame at this position
+            matrix_local = gp_obj.matrix_local.copy()
+            original_mpi = gp_obj.matrix_parent_inverse.copy()
+            set_lock_for_frame(gp_obj, active_kf.frame_number, anchor_pos, anchor_local_offset, original_mpi, matrix_local)
+
+        # Apply world lock with new anchor
+        apply_object_world_lock_for_frame(gp_obj, scene)
+
         # Move cursor to anchor
         scene.cursor.location = anchor_pos
-        
-        self.report({'INFO'}, f"Anchor auto-set at frame {active_kf.frame_number}")
-        
+
+        # Invalidate motion path so it updates
+        invalidate_motion_path()
+
+        self.report({'INFO'}, f"Anchor auto-set and locked at frame {active_kf.frame_number}")
+
         # Redraw
         for area in context.screen.areas:
             if area.type == 'VIEW_3D':
                 area.tag_redraw()
-        
+
         return {'FINISHED'}
 
 
@@ -480,12 +522,36 @@ class WONION_OT_snap_to_cursor(bpy.types.Operator):
         # Mark data as updated
         gp_obj.data.update_tag()
 
+        # Set anchor at cursor position (where strokes now are)
+        cam_dir = get_camera_direction(scene)
+        set_anchor_for_frame(gp_obj, active_layer.name, active_kf.frame_number, cursor_pos, cam_dir)
+
+        # Calculate anchor_local_offset
+        gp_origin_world = gp_obj.matrix_world.to_translation()
+        offset_world_anchor = cursor_pos - gp_origin_world
+        anchor_local_offset = gp_obj.matrix_world.to_3x3().inverted() @ offset_world_anchor
+
+        # Lock the frame (or update if already locked)
+        if is_object_locked_at_frame(gp_obj, active_kf.frame_number):
+            update_lock_anchor(gp_obj, active_kf.frame_number, cursor_pos, anchor_local_offset)
+        else:
+            # Lock the frame at this position
+            matrix_local = gp_obj.matrix_local.copy()
+            original_mpi = gp_obj.matrix_parent_inverse.copy()
+            set_lock_for_frame(gp_obj, active_kf.frame_number, cursor_pos, anchor_local_offset, original_mpi, matrix_local)
+
+        # Apply world lock with new anchor
+        apply_object_world_lock_for_frame(gp_obj, scene)
+
+        # Invalidate motion path so it updates
+        invalidate_motion_path()
+
         # Redraw
         for area in context.screen.areas:
             if area.type == 'VIEW_3D':
                 area.tag_redraw()
 
-        self.report({'INFO'}, f"Snapped {len(selected_strokes)} strokes to cursor")
+        self.report({'INFO'}, f"Snapped {len(selected_strokes)} strokes to cursor and locked at frame {active_kf.frame_number}")
         return {'FINISHED'}
 
 

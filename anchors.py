@@ -621,6 +621,32 @@ def set_lock_for_frame(gp_obj, frame, anchor_world, anchor_local_offset,
     set_object_lock_data(gp_obj, lock_data)
 
 
+def update_lock_anchor(gp_obj, frame, anchor_world, anchor_local_offset=None):
+    """Update anchor position for an existing locked frame.
+
+    Use this when changing anchor position without re-locking.
+    """
+    lock_data = get_object_lock_data(gp_obj)
+    frame_str = str(frame)
+
+    if frame_str not in lock_data:
+        return False
+
+    data = lock_data[frame_str]
+    if not isinstance(data, dict) or not data.get("world_locked", False):
+        return False
+
+    # Update anchor position
+    data["anchor_world"] = [anchor_world[0], anchor_world[1], anchor_world[2]]
+
+    if anchor_local_offset is not None:
+        data["anchor_local_offset"] = [anchor_local_offset[0], anchor_local_offset[1], anchor_local_offset[2]]
+
+    lock_data[frame_str] = data
+    set_object_lock_data(gp_obj, lock_data)
+    return True
+
+
 def remove_lock_for_frame(gp_obj, frame):
     """Remove world lock for a specific frame (unlock)."""
     lock_data = get_object_lock_data(gp_obj)
@@ -835,8 +861,8 @@ def get_interpolated_position(gp_obj, frame):
         pass
 
     if smoothing > 0 and len(sorted_frames) >= 2:
-        # Use Catmull-Rom spline for smooth interpolation
-        # Get 4 control points (duplicate at boundaries)
+        # Generate subdivision points to match visual motion path
+        # Then interpolate along that polyline
         n = len(sorted_frames)
         p0_idx = max(0, prev_idx - 1)
         p1_idx = prev_idx
@@ -848,7 +874,24 @@ def get_interpolated_position(gp_obj, frame):
         p2 = next_pos
         p3 = Vector(locked[sorted_frames[p3_idx]]['anchor_world'])
 
-        pos = catmull_rom_point(p0, p1, p2, p3, t)
+        # Generate subdivision points for this segment (matching visual path)
+        segment_points = [p1]
+        for j in range(1, smoothing + 1):
+            sub_t = j / (smoothing + 1)
+            pt = catmull_rom_point(p0, p1, p2, p3, sub_t)
+            segment_points.append(pt)
+        segment_points.append(p2)
+
+        # Find which sub-segment of the polyline t falls into
+        # t goes from 0 to 1 across the whole segment
+        # We have (smoothing + 1) sub-segments
+        num_sub_segments = smoothing + 1
+        scaled_t = t * num_sub_segments
+        sub_idx = min(int(scaled_t), num_sub_segments - 1)
+        local_t = scaled_t - sub_idx
+
+        # Linearly interpolate within that sub-segment
+        pos = segment_points[sub_idx].lerp(segment_points[sub_idx + 1], local_t)
     elif interp_type == 'LINEAR':
         pos = prev_pos.lerp(next_pos, t)
     elif interp_type == 'BEZIER':

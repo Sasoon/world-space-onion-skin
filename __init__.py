@@ -25,6 +25,7 @@ bl_info = {
 }
 
 import bpy
+from bpy.app.handlers import persistent
 
 # Handle reloading for development
 if "bpy" in locals():
@@ -67,6 +68,16 @@ classes = (
 )
 
 
+@persistent
+def on_load_post(dummy):
+    """Called after a .blend file is loaded. Re-register draw handlers if addon is enabled."""
+    # Check if any scene has the addon enabled
+    for scene in bpy.data.scenes:
+        if hasattr(scene, 'world_onion') and scene.world_onion.enabled:
+            drawing.register_draw_handlers()
+            break
+
+
 def register():
     """Register the addon."""
     # Register classes
@@ -82,11 +93,19 @@ def register():
     # Register timeline drawing
     timeline_drawing.register_timeline_handlers()
 
+    # Register load handler to restore draw callbacks after file load
+    if on_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(on_load_post)
+
     print("World Space Onion Skin registered")
 
 
 def unregister():
     """Unregister the addon."""
+    # Unregister load handler
+    if on_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(on_load_post)
+
     # Unregister draw handlers
     drawing.unregister_draw_handlers()
 
