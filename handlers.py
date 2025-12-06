@@ -256,16 +256,8 @@ def apply_object_world_lock_for_frame(gp_obj, scene):
             )
             return  # Don't reset MPI - preserve interpolated position
 
-    # Truly no lock context - reset to normal parenting
-    lock_data = get_object_lock_data(gp_obj)
-    # Try to find original_parent_inverse from any frame's data
-    original_mpi = None
-    for frame_str, data in lock_data.items():
-        if isinstance(data, dict) and "original_parent_inverse" in data:
-            original_mpi = data["original_parent_inverse"]
-            break
-
-    reset_object_world_lock(gp_obj, original_mpi)
+    # Truly no lock context - reset to identity MPI (clean camera-parented state)
+    reset_object_world_lock(gp_obj, None)
 
 
 @persistent
@@ -546,15 +538,19 @@ def _on_depsgraph_update_impl(scene, depsgraph):
                         # Migrate both anchor data and object lock data
                         migrate_anchor_data(gp_obj, layer_name, old_frame, new_frame)
                         migrate_object_lock_frame(gp_obj, old_frame, new_frame)
+                    elif len(removed) == len(added):
+                        # Multiple keyframes moved together - migrate each pair
+                        # Sort both lists to match old->new by position
+                        removed_sorted = sorted(removed)
+                        added_sorted = sorted(added)
+                        for old_frame, new_frame in zip(removed_sorted, added_sorted):
+                            moved_frames.add(old_frame)
+                            migrate_anchor_data(gp_obj, layer_name, old_frame, new_frame)
+                            migrate_object_lock_frame(gp_obj, old_frame, new_frame)
 
-            # Clean up orphaned lock data for deleted keyframes (not moves)
-            from .anchors import remove_lock_for_frame
-            for layer_name, removed_frames in removed_by_layer.items():
-                for frame in removed_frames:
-                    # If this frame wasn't moved, it's a deletion - clean up lock data
-                    if frame not in moved_frames:
-                        if is_object_locked_at_frame(gp_obj, frame):
-                            remove_lock_for_frame(gp_obj, frame)
+            # Note: We intentionally don't auto-delete lock data for removed keyframes.
+            # Orphaned lock data is harmless, and auto-deletion caused issues with
+            # multi-keyframe moves. Users can use "Clear All Locks" to clean up.
 
         # Update user-facing anchor from strokes if snap_to_stroke enabled
         active_layer = gp_obj.data.layers.active

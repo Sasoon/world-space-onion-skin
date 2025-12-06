@@ -22,6 +22,8 @@ from .anchors import (
     set_lock_for_frame,
     remove_lock_for_frame,
     update_lock_anchor,
+    get_object_lock_data,
+    set_object_lock_data,
 )
 from .transforms import get_layer_transform, get_camera_direction
 from .handlers import apply_object_world_lock_for_frame, reset_object_world_lock, apply_world_lock_from_stored
@@ -747,76 +749,95 @@ class WONION_OT_toggle_world_lock(bpy.types.Operator):
         currently_locked = is_object_locked_at_frame(gp_obj, visible_frame)
 
         if currently_locked:
-            # Unlock
+            # Unlock - reset to identity MPI (clean camera-parented state)
             remove_lock_for_frame(gp_obj, visible_frame)
-            reset_object_world_lock(gp_obj)
+            reset_object_world_lock(gp_obj, None)  # Identity MPI
             self.report({'INFO'}, f"World lock OFF for frame {visible_frame}")
         else:
-            # Lock - store anchor data for pivot-based billboard effect
-            original_frame = scene.frame_current
-            frame_changed = visible_frame != original_frame
-            lock_payload = None
+            # Lock - check if we have existing lock data to restore (even if currently unlocked)
+            all_lock_data = get_object_lock_data(gp_obj)
+            frame_str = str(visible_frame)
+            existing_data = all_lock_data.get(frame_str)
 
-            try:
-                if frame_changed:
-                    scene.frame_set(visible_frame)
+            if existing_data and isinstance(existing_data, dict) and "anchor_world" in existing_data:
+                # Restore existing lock data (re-locking after unlock)
+                all_lock_data[frame_str]["world_locked"] = True
+                set_object_lock_data(gp_obj, all_lock_data)
 
-                # Ensure matrices are up to date for the visible keyframe
-                context.view_layer.update()
+                # Apply the restored lock (already imported at top of file)
+                apply_world_lock_from_stored(
+                    gp_obj,
+                    existing_data["anchor_world"],
+                    existing_data["anchor_local_offset"],
+                    existing_data["matrix_local"]
+                )
+                self.report({'INFO'}, f"World lock RESTORED for frame {visible_frame}")
+            else:
+                # New lock - calculate anchor data for pivot-based billboard effect
+                original_frame = scene.frame_current
+                frame_changed = visible_frame != original_frame
+                lock_payload = None
 
-                if gp_obj.parent is None:
-                    self.report({'WARNING'}, "Cannot lock - GP has no parent")
-                    return {'CANCELLED'}
+                try:
+                    if frame_changed:
+                        scene.frame_set(visible_frame)
 
-                # Calculate anchor (stroke center) for pivot-based rotation
-                # Try to get anchor from active layer's strokes
-                active_layer = gp_obj.data.layers.active
-                anchor_world = None
-                anchor_local = None
-                if active_layer is not None:
-                    anchor_world, anchor_local = calculate_anchor_from_strokes(
-                        gp_obj, active_layer, visible_frame, return_local=True
+                    # Ensure matrices are up to date for the visible keyframe
+                    context.view_layer.update()
+
+                    if gp_obj.parent is None:
+                        self.report({'WARNING'}, "Cannot lock - GP has no parent")
+                        return {'CANCELLED'}
+
+                    # Calculate anchor (stroke center) for pivot-based rotation
+                    # Try to get anchor from active layer's strokes
+                    active_layer = gp_obj.data.layers.active
+                    anchor_world = None
+                    anchor_local = None
+                    if active_layer is not None:
+                        anchor_world, anchor_local = calculate_anchor_from_strokes(
+                            gp_obj, active_layer, visible_frame, return_local=True
+                        )
+
+                    # Fallback to GP origin if no strokes
+                    if anchor_world is None:
+                        anchor_world = gp_obj.matrix_world.to_translation().copy()
+                        anchor_local = Vector((0, 0, 0))
+
+                    # Use raw local anchor position (stable regardless of MPI)
+                    anchor_local_offset, matrix_local = calculate_anchor_local_offset(gp_obj, anchor_local)
+                    original_mpi = gp_obj.matrix_parent_inverse.copy()
+
+                    # Store the lock data captured from the visible keyframe
+                    set_lock_for_frame(
+                        gp_obj,
+                        visible_frame,
+                        anchor_world,
+                        anchor_local_offset,
+                        original_mpi,
+                        matrix_local,
                     )
 
-                # Fallback to GP origin if no strokes
-                if anchor_world is None:
-                    anchor_world = gp_obj.matrix_world.to_translation().copy()
-                    anchor_local = Vector((0, 0, 0))
+                    lock_payload = (anchor_world, anchor_local_offset, matrix_local)
 
-                # Use raw local anchor position (stable regardless of MPI)
-                anchor_local_offset, matrix_local = calculate_anchor_local_offset(gp_obj, anchor_local)
-                original_mpi = gp_obj.matrix_parent_inverse.copy()
+                finally:
+                    if frame_changed:
+                        scene.frame_set(original_frame)
+                    # Refresh depsgraph at the user's original frame
+                    context.view_layer.update()
 
-                # Store the lock data captured from the visible keyframe
-                set_lock_for_frame(
-                    gp_obj,
-                    visible_frame,
-                    anchor_world,
-                    anchor_local_offset,
-                    original_mpi,
-                    matrix_local,
-                )
+                if lock_payload is None:
+                    return {'CANCELLED'}
 
-                lock_payload = (anchor_world, anchor_local_offset, matrix_local)
+                anchor_world, anchor_local_offset, matrix_local = lock_payload
 
-            finally:
-                if frame_changed:
-                    scene.frame_set(original_frame)
-                # Refresh depsgraph at the user's original frame
+                # Apply the lock immediately (with pivot-based billboard effect)
+                apply_world_lock_from_stored(gp_obj, anchor_world, anchor_local_offset, matrix_local)
+
+                # Force update and verify anchor position stays fixed
                 context.view_layer.update()
 
-            if lock_payload is None:
-                return {'CANCELLED'}
-
-            anchor_world, anchor_local_offset, matrix_local = lock_payload
-
-            # Apply the lock immediately (with pivot-based billboard effect)
-            apply_world_lock_from_stored(gp_obj, anchor_world, anchor_local_offset, matrix_local)
-
-            # Force update and verify anchor position stays fixed
-            context.view_layer.update()
-
-            self.report({'INFO'}, f"World lock ON for frame {visible_frame}")
+                self.report({'INFO'}, f"World lock ON for frame {visible_frame}")
 
         self._redraw_viewports(context)
         return {'FINISHED'}
@@ -855,7 +876,18 @@ class WONION_OT_toggle_world_lock(bpy.types.Operator):
                     if is_object_locked_at_frame(gp_obj, frame_num):
                         continue  # Skip already locked
 
-                    # Jump to this frame to get correct matrices and strokes
+                    # Check if we have existing lock data to restore (even if currently unlocked)
+                    all_lock_data = get_object_lock_data(gp_obj)
+                    frame_str = str(frame_num)
+                    existing_data = all_lock_data.get(frame_str)
+                    if existing_data and isinstance(existing_data, dict) and "anchor_world" in existing_data:
+                        # Restore existing lock data (re-locking after unlock)
+                        all_lock_data[frame_str]["world_locked"] = True
+                        set_object_lock_data(gp_obj, all_lock_data)
+                        lock_count += 1
+                        continue
+
+                    # New lock - jump to this frame to get correct matrices and strokes
                     scene.frame_set(frame_num)
                     context.view_layer.update()
 
@@ -892,8 +924,9 @@ class WONION_OT_toggle_world_lock(bpy.types.Operator):
             for frame_num in selected_frames:
                 remove_lock_for_frame(gp_obj, frame_num)
                 unlock_count += 1
-            # Reset to normal parenting
-            reset_object_world_lock(gp_obj)
+
+            # Reset to identity MPI (clean camera-parented state)
+            reset_object_world_lock(gp_obj, None)
             self.report({'INFO'}, f"World lock OFF for {unlock_count} frames")
 
         self._redraw_viewports(context)
