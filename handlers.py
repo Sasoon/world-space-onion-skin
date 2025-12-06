@@ -11,6 +11,7 @@ from .anchors import (
     get_anchor_for_frame,
     set_anchor_for_frame,
     calculate_anchor_from_strokes,
+    calculate_anchor_local_offset,
     get_current_keyframes_set,
     get_visible_keyframe,
     migrate_anchor_data,
@@ -32,7 +33,6 @@ _last_keyframe_set = set()
 _last_active_layer_name = None
 _last_active_gp = None  # Track active GP object for change detection
 _in_depsgraph_handler = False  # Prevent recursive handler calls
-_settings_logged = False  # Only log settings once per session
 
 
 def get_last_keyframe_set():
@@ -83,10 +83,6 @@ def apply_world_lock_from_stored(gp_obj, anchor_world, anchor_local_offset, matr
     if gp_obj is None:
         return
 
-    parent = gp_obj.parent
-    if parent is None:
-        return
-
     # Convert from list if needed
     if isinstance(anchor_world, list):
         anchor_world = Vector(anchor_world)
@@ -94,6 +90,14 @@ def apply_world_lock_from_stored(gp_obj, anchor_world, anchor_local_offset, matr
         anchor_local_offset = Vector(anchor_local_offset)
     if isinstance(matrix_local_stored, list):
         matrix_local_stored = Matrix(matrix_local_stored)
+
+    parent = gp_obj.parent
+    if parent is None:
+        # No parent - apply transform directly using matrix_local rotation
+        local_rot = matrix_local_stored.to_3x3()
+        gp_position = anchor_world - local_rot @ anchor_local_offset
+        gp_obj.location = gp_position
+        return
 
     # Billboard rotation: camera rotation with local orientation preserved
     camera_rot = parent.matrix_world.to_3x3()
@@ -182,7 +186,28 @@ def apply_object_world_lock_for_frame(gp_obj, scene):
             )
             return
 
-    # No lock active - reset to normal parenting
+    # No locked keyframe visible at current frame
+    # BUT if interpolation is enabled, we may still be between locked frames
+    # (e.g., new unlocked keyframe created via auto-keying at interpolated position)
+    if settings.interpolation_enabled:
+        interp_pos, interp_info = get_interpolated_position(gp_obj, current_frame)
+        if interp_pos is not None and interp_info is not None:
+            # We're between locked frames - apply interpolated position
+            # This preserves the visual position when a new unlocked keyframe is created
+            prev_data = interp_info['prev_data']
+            anchor_world = [interp_pos.x, interp_pos.y, interp_pos.z]
+            anchor_local_offset = prev_data["anchor_local_offset"]
+            matrix_local = prev_data["matrix_local"]
+
+            apply_world_lock_from_stored(
+                gp_obj,
+                anchor_world,
+                anchor_local_offset,
+                matrix_local
+            )
+            return  # Don't reset MPI - preserve interpolated position
+
+    # Truly no lock context - reset to normal parenting
     lock_data = get_object_lock_data(gp_obj)
     # Try to find original_parent_inverse from any frame's data
     original_mpi = None
@@ -212,15 +237,6 @@ def on_frame_change(scene):
     if not settings.enabled:
         return
 
-    # Log settings once per session for debugging
-    global _settings_logged
-    if not _settings_logged:
-        print(f"[SETTINGS] interpolation_enabled={settings.interpolation_enabled}, "
-              f"anchor_enabled={settings.anchor_enabled}, "
-              f"anchor_auto_cursor={settings.anchor_auto_cursor}, "
-              f"motion_path_enabled={settings.motion_path_enabled}")
-        _settings_logged = True
-
     # === OBJECT-LEVEL WORLD LOCK ===
     # Apply to ALL GP objects with world locks (not just active)
     # This ensures locks work even when GP object isn't selected
@@ -240,7 +256,6 @@ def on_frame_change(scene):
         if interp_pos is not None and interp_info is not None:
             # We're interpolating between frames - move cursor to interpolated position
             scene.cursor.location = interp_pos.copy()
-            print(f"[CURSOR] Interpolating cursor to {interp_pos}")
             cursor_handled_by_interpolation = True
             try:
                 align_canvas_to_cursor(bpy.context)
@@ -463,6 +478,13 @@ def _on_depsgraph_update_impl(scene, depsgraph):
             for layer_name, frame in (current_kf_set - _last_keyframe_set):
                 added_by_layer.setdefault(layer_name, []).append(frame)
 
+            # Invalidate motion path if any keyframes changed
+            if removed_by_layer or added_by_layer:
+                invalidate_motion_path()
+
+            # Track which frames were moved (to distinguish from deletions)
+            moved_frames = set()
+
             # Check for moves (1 removed + 1 added on same layer = move)
             for layer_name in removed_by_layer:
                 if layer_name in added_by_layer:
@@ -471,9 +493,19 @@ def _on_depsgraph_update_impl(scene, depsgraph):
                     if len(removed) == 1 and len(added) == 1:
                         old_frame = removed[0]
                         new_frame = added[0]
+                        moved_frames.add(old_frame)
                         # Migrate both anchor data and object lock data
                         migrate_anchor_data(gp_obj, layer_name, old_frame, new_frame)
                         migrate_object_lock_frame(gp_obj, old_frame, new_frame)
+
+            # Clean up orphaned lock data for deleted keyframes (not moves)
+            from .anchors import remove_lock_for_frame
+            for layer_name, removed_frames in removed_by_layer.items():
+                for frame in removed_frames:
+                    # If this frame wasn't moved, it's a deletion - clean up lock data
+                    if frame not in moved_frames:
+                        if is_object_locked_at_frame(gp_obj, frame):
+                            remove_lock_for_frame(gp_obj, frame)
 
         # Update user-facing anchor from strokes if snap_to_stroke enabled
         active_layer = gp_obj.data.layers.active
@@ -519,20 +551,19 @@ def _on_depsgraph_update_impl(scene, depsgraph):
                                     # Calculate anchor from strokes for pivot-based rotation
                                     active_layer = gp_obj.data.layers.active
                                     anchor_world = None
+                                    anchor_local = None
                                     if active_layer is not None:
-                                        anchor_world = calculate_anchor_from_strokes(gp_obj, active_layer, frame_num)
+                                        anchor_world, anchor_local = calculate_anchor_from_strokes(
+                                            gp_obj, active_layer, frame_num, return_local=True
+                                        )
 
-                                    gp_origin_world = gp_obj.matrix_world.to_translation()
                                     if anchor_world is None:
-                                        anchor_world = gp_origin_world.copy()
+                                        anchor_world = gp_obj.matrix_world.to_translation().copy()
+                                        anchor_local = Vector((0, 0, 0))
 
-                                    # Calculate anchor offset in GP local coordinates
-                                    offset_world = anchor_world - gp_origin_world
-                                    anchor_local_offset = gp_obj.matrix_world.to_3x3().inverted() @ offset_world
-
-                                    matrix_local = gp_obj.matrix_local.copy()
+                                    # Use raw local anchor position (stable regardless of MPI)
+                                    anchor_local_offset, matrix_local = calculate_anchor_local_offset(gp_obj, anchor_local)
                                     original_mpi = gp_obj.matrix_parent_inverse.copy()
-                                    print(f"[INHERIT] Auto-locking new frame {frame_num}")
                                     set_lock_for_frame(gp_obj, frame_num, anchor_world, anchor_local_offset, original_mpi, matrix_local)
 
         # Update tracking set

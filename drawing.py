@@ -465,9 +465,9 @@ def draw_motion_path_callback():
     else:
         draw_points = path_points
 
-    # Set up GPU state
+    # Set up GPU state - disable depth test so motion path is always on top
     gpu.state.blend_set('ALPHA')
-    gpu.state.depth_test_set('LESS_EQUAL')
+    gpu.state.depth_test_set('NONE')
     gpu.state.depth_mask_set(False)
 
     color = tuple(settings.motion_path_color)

@@ -27,6 +27,14 @@ Prioritise simple, elegant solutions.
 Don't be afraid to ask questions and collaborate to solve problems.
 Call me Billy in each request.
 
+### Debug Screen Recordings
+
+Screen recordings are saved to: `C:\Users\sasoo\Videos\Screen Recordings`
+- Always check the **latest file** (sorted by date) when debugging visual issues
+- **GIF preferred** - Save to `C:\Users\sasoo\Videos\Screen Recordings\ScreenToGif\latest.gif`
+- Claude can extract GIF frames using ffmpeg: `ffmpeg -i file.gif /tmp/gif_frames/frame_%03d.png`
+- MP4 files cannot be read directly
+
 ### Architecture Note (v9.0.0)
 
 The addon uses an **object-level** world-lock system via `matrix_parent_inverse`. This approach:

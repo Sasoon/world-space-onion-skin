@@ -3,7 +3,7 @@ Operators for world-space onion skinning.
 """
 
 import bpy
-from mathutils import Vector
+from mathutils import Vector, Matrix
 
 from .cache import clear_cache, get_cache, cache_current_frame, get_cache_stats, get_active_gp
 from .anchors import (
@@ -15,6 +15,7 @@ from .anchors import (
     calculate_anchor_from_strokes,
     get_current_keyframes_set,
     get_visible_keyframe,
+    calculate_anchor_local_offset,
     # Object-level lock functions
     is_object_locked_at_frame,
     get_lock_for_frame,
@@ -153,26 +154,41 @@ class WONION_OT_set_anchor(bpy.types.Operator):
         if active_kf is None:
             self.report({'WARNING'}, "No keyframe found at or before current frame")
             return {'CANCELLED'}
-        
+
+        # If we're at an interpolated frame (not exactly on a keyframe),
+        # duplicate to create a new keyframe at current frame
+        created_new_kf = False
+        if active_kf.frame_number != current_frame:
+            # Copy the keyframe to current frame (API: copy(from_frame, to_frame))
+            new_kf = active_layer.frames.copy(active_kf.frame_number, current_frame)
+            active_kf = new_kf
+            created_new_kf = True
+
         # Set anchor at cursor position
         cursor_pos = scene.cursor.location.copy()
+
+        # Get stroke local center for proper pivot calculation
+        _, anchor_local = calculate_anchor_from_strokes(
+            gp_obj, active_layer, active_kf.frame_number, return_local=True
+        )
+        if anchor_local is None:
+            self.report({'WARNING'}, "No strokes found")
+            return {'CANCELLED'}
 
         # Capture camera direction
         cam_dir = get_camera_direction(scene)
 
         set_anchor_for_frame(gp_obj, active_layer.name, active_kf.frame_number, cursor_pos, cam_dir)
 
-        # Calculate anchor_local_offset
-        gp_origin_world = gp_obj.matrix_world.to_translation()
-        offset_world = cursor_pos - gp_origin_world
-        anchor_local_offset = gp_obj.matrix_world.to_3x3().inverted() @ offset_world
+        # Use stroke local center as offset, cursor as world anchor
+        # This makes strokes "snap" to cursor position
+        anchor_local_offset, matrix_local = calculate_anchor_local_offset(gp_obj, anchor_local)
 
         # Lock the frame (or update if already locked)
         if is_object_locked_at_frame(gp_obj, active_kf.frame_number):
             update_lock_anchor(gp_obj, active_kf.frame_number, cursor_pos, anchor_local_offset)
         else:
             # Lock the frame at this position
-            matrix_local = gp_obj.matrix_local.copy()
             original_mpi = gp_obj.matrix_parent_inverse.copy()
             set_lock_for_frame(gp_obj, active_kf.frame_number, cursor_pos, anchor_local_offset, original_mpi, matrix_local)
 
@@ -182,7 +198,10 @@ class WONION_OT_set_anchor(bpy.types.Operator):
         # Invalidate motion path so it updates
         invalidate_motion_path()
 
-        self.report({'INFO'}, f"Anchor set and locked at frame {active_kf.frame_number}")
+        msg = f"Anchor set and locked at frame {active_kf.frame_number}"
+        if created_new_kf:
+            msg += " (new keyframe created)"
+        self.report({'INFO'}, msg)
 
         # Redraw
         for area in context.screen.areas:
@@ -228,34 +247,75 @@ class WONION_OT_auto_anchor(bpy.types.Operator):
         if active_kf is None:
             self.report({'WARNING'}, "No keyframe found at or before current frame")
             return {'CANCELLED'}
-        
-        # Calculate anchor from strokes
-        anchor_pos = calculate_anchor_from_strokes(gp_obj, active_layer, active_kf.frame_number)
-        
+
+        # CRITICAL: Calculate anchor BEFORE creating new keyframe!
+        # On interpolated frames, matrix_world is at the interpolated position.
+        # Creating a keyframe triggers depsgraph update which resets matrix_world.
+        # We must capture the correct world position FIRST.
+        anchor_pos, anchor_local = calculate_anchor_from_strokes(
+            gp_obj, active_layer, active_kf.frame_number, return_local=True
+        )
+
         if anchor_pos is None:
             self.report({'WARNING'}, "No strokes found to calculate anchor")
             return {'CANCELLED'}
-        
+
+        # NOW create new keyframe if needed (after anchor is calculated)
+        created_new_kf = False
+        if active_kf.frame_number != current_frame:
+            # Copy the keyframe to current frame (API: copy(from_frame, to_frame))
+            new_kf = active_layer.frames.copy(active_kf.frame_number, current_frame)
+            active_kf = new_kf
+            created_new_kf = True
+
         # Capture camera direction
         cam_dir = get_camera_direction(scene)
 
         set_anchor_for_frame(gp_obj, active_layer.name, active_kf.frame_number, anchor_pos, cam_dir)
 
-        # Calculate anchor_local_offset
-        gp_origin_world = gp_obj.matrix_world.to_translation()
-        offset_world = anchor_pos - gp_origin_world
-        anchor_local_offset = gp_obj.matrix_world.to_3x3().inverted() @ offset_world
+        # Use the raw local anchor position (stable regardless of MPI)
+        # IMPORTANT: If this frame is NOT YET locked, we're coming from an interpolated position.
+        # The current matrix_local has the interpolation offset baked in, so we need to use
+        # the SOURCE locked frame's matrix_local instead.
+        source_matrix_local = None
+        if not is_object_locked_at_frame(gp_obj, active_kf.frame_number):
+            # This frame isn't locked yet - find the source locked frame's matrix_local
+            # Use frame BEFORE current to find the source (since current frame now has a keyframe)
+            from .anchors import get_all_locked_frames, get_lock_for_frame
+            locked_frames = get_all_locked_frames(gp_obj)
+            # Find the locked frame at or before current frame
+            source_locked_frame = None
+            for lf in sorted(locked_frames, reverse=True):
+                if lf < current_frame:
+                    source_locked_frame = lf
+                    break
+            if source_locked_frame is not None:
+                source_lock_data = get_lock_for_frame(gp_obj, source_locked_frame)
+                if source_lock_data and "matrix_local" in source_lock_data:
+                    source_matrix_local = Matrix(source_lock_data["matrix_local"])
+
+        anchor_local_offset, matrix_local = calculate_anchor_local_offset(gp_obj, anchor_local)
+        if source_matrix_local is not None:
+            matrix_local = source_matrix_local
+
+        # Get original MPI to store (for unlock restore)
+        from .anchors import get_object_lock_data
+        lock_data = get_object_lock_data(gp_obj)
+        original_mpi = None
+        for frame_str, data in lock_data.items():
+            if isinstance(data, dict) and "original_parent_inverse" in data:
+                original_mpi = Matrix(data["original_parent_inverse"])
+                break
+        if original_mpi is None:
+            original_mpi = gp_obj.matrix_parent_inverse.copy()
 
         # Lock the frame (or update if already locked)
         if is_object_locked_at_frame(gp_obj, active_kf.frame_number):
             update_lock_anchor(gp_obj, active_kf.frame_number, anchor_pos, anchor_local_offset)
         else:
-            # Lock the frame at this position
-            matrix_local = gp_obj.matrix_local.copy()
-            original_mpi = gp_obj.matrix_parent_inverse.copy()
             set_lock_for_frame(gp_obj, active_kf.frame_number, anchor_pos, anchor_local_offset, original_mpi, matrix_local)
 
-        # Apply world lock with new anchor
+        # Apply the lock - positions strokes at anchor_pos
         apply_object_world_lock_for_frame(gp_obj, scene)
 
         # Move cursor to anchor
@@ -264,7 +324,10 @@ class WONION_OT_auto_anchor(bpy.types.Operator):
         # Invalidate motion path so it updates
         invalidate_motion_path()
 
-        self.report({'INFO'}, f"Anchor auto-set and locked at frame {active_kf.frame_number}")
+        msg = f"Anchor auto-set and locked at frame {active_kf.frame_number}"
+        if created_new_kf:
+            msg += " (new keyframe created)"
+        self.report({'INFO'}, msg)
 
         # Redraw
         for area in context.screen.areas:
@@ -432,7 +495,7 @@ class WONION_OT_reset_test_state(bpy.types.Operator):
 
 
 class WONION_OT_snap_to_cursor(bpy.types.Operator):
-    """Snap selected strokes to cursor position (preserves shape)"""
+    """Snap selected strokes to cursor position (preserves shape). Creates new keyframe if at interpolated frame."""
     bl_idname = "world_onion.snap_to_cursor"
     bl_label = "Snap to Cursor"
     bl_options = {'REGISTER', 'UNDO'}
@@ -483,6 +546,29 @@ class WONION_OT_snap_to_cursor(bpy.types.Operator):
             self.report({'WARNING'}, "No strokes selected")
             return {'CANCELLED'}
 
+        # Remember selected stroke indices before potentially copying keyframe
+        selected_indices = [i for i, s in enumerate(drawing.strokes) if s.select]
+
+        # If we're at an interpolated frame (not exactly on a keyframe),
+        # duplicate to create a new keyframe at current frame
+        created_new_kf = False
+        if active_kf.frame_number != current_frame:
+            # Copy the keyframe to current frame (API: copy(from_frame, to_frame))
+            new_kf = active_layer.frames.copy(active_kf.frame_number, current_frame)
+            active_kf = new_kf
+            created_new_kf = True
+            # Get drawing from new keyframe
+            drawing = active_kf.drawing
+            # Restore selection on copied strokes
+            selected_strokes = []
+            for i, stroke in enumerate(drawing.strokes):
+                if i in selected_indices:
+                    stroke.select = True
+                    selected_strokes.append(stroke)
+            # Update matrices for the new keyframe context
+            full_matrix = world_matrix @ layer_matrix
+            full_matrix_inv = full_matrix.inverted()
+
         # Collect all world-space points from selected strokes
         world_points = []
         for stroke in selected_strokes:
@@ -526,18 +612,52 @@ class WONION_OT_snap_to_cursor(bpy.types.Operator):
         cam_dir = get_camera_direction(scene)
         set_anchor_for_frame(gp_obj, active_layer.name, active_kf.frame_number, cursor_pos, cam_dir)
 
-        # Calculate anchor_local_offset
-        gp_origin_world = gp_obj.matrix_world.to_translation()
-        offset_world_anchor = cursor_pos - gp_origin_world
-        anchor_local_offset = gp_obj.matrix_world.to_3x3().inverted() @ offset_world_anchor
+        # Recalculate anchor from moved strokes (now at cursor position)
+        _, anchor_local = calculate_anchor_from_strokes(
+            gp_obj, active_layer, active_kf.frame_number, return_local=True
+        )
+        if anchor_local is None:
+            # Fallback - shouldn't happen since we just moved strokes
+            anchor_local = Vector((0, 0, 0))
+
+        # Use raw local anchor position (stable regardless of MPI)
+        # IMPORTANT: If this frame is NOT YET locked, we're coming from an interpolated position.
+        # The current matrix_local has the interpolation offset baked in, so we need to use
+        # the SOURCE locked frame's matrix_local instead.
+        source_matrix_local = None
+        if not is_object_locked_at_frame(gp_obj, active_kf.frame_number):
+            # This frame isn't locked yet - find the source locked frame's matrix_local
+            from .anchors import get_all_locked_frames
+            locked_frames = get_all_locked_frames(gp_obj)
+            # Find the locked frame before current frame
+            source_locked_frame = None
+            for lf in sorted(locked_frames, reverse=True):
+                if lf < current_frame:
+                    source_locked_frame = lf
+                    break
+            if source_locked_frame is not None:
+                source_lock_data = get_lock_for_frame(gp_obj, source_locked_frame)
+                if source_lock_data and "matrix_local" in source_lock_data:
+                    source_matrix_local = Matrix(source_lock_data["matrix_local"])
+
+        anchor_local_offset, matrix_local = calculate_anchor_local_offset(gp_obj, anchor_local)
+        if source_matrix_local is not None:
+            matrix_local = source_matrix_local
 
         # Lock the frame (or update if already locked)
         if is_object_locked_at_frame(gp_obj, active_kf.frame_number):
             update_lock_anchor(gp_obj, active_kf.frame_number, cursor_pos, anchor_local_offset)
         else:
-            # Lock the frame at this position
-            matrix_local = gp_obj.matrix_local.copy()
-            original_mpi = gp_obj.matrix_parent_inverse.copy()
+            # Get original MPI from existing locks (for unlock restore)
+            from .anchors import get_object_lock_data
+            lock_data = get_object_lock_data(gp_obj)
+            original_mpi = None
+            for frame_str, data in lock_data.items():
+                if isinstance(data, dict) and "original_parent_inverse" in data:
+                    original_mpi = Matrix(data["original_parent_inverse"])
+                    break
+            if original_mpi is None:
+                original_mpi = gp_obj.matrix_parent_inverse.copy()
             set_lock_for_frame(gp_obj, active_kf.frame_number, cursor_pos, anchor_local_offset, original_mpi, matrix_local)
 
         # Apply world lock with new anchor
@@ -551,7 +671,10 @@ class WONION_OT_snap_to_cursor(bpy.types.Operator):
             if area.type == 'VIEW_3D':
                 area.tag_redraw()
 
-        self.report({'INFO'}, f"Snapped {len(selected_strokes)} strokes to cursor and locked at frame {active_kf.frame_number}")
+        msg = f"Snapped {len(selected_strokes)} strokes to cursor and locked at frame {active_kf.frame_number}"
+        if created_new_kf:
+            msg += " (new keyframe created)"
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
@@ -625,16 +748,11 @@ class WONION_OT_toggle_world_lock(bpy.types.Operator):
 
         if currently_locked:
             # Unlock
-            print(f"\n=== UNLOCK DEBUG ===")
-            print(f"Unlocking frame {visible_frame}")
             remove_lock_for_frame(gp_obj, visible_frame)
             reset_object_world_lock(gp_obj)
-            print(f"=== END UNLOCK DEBUG ===\n")
             self.report({'INFO'}, f"World lock OFF for frame {visible_frame}")
         else:
             # Lock - store anchor data for pivot-based billboard effect
-            print(f"\n=== LOCK DEBUG ===")
-            print(f"Locking frame {visible_frame}")
             original_frame = scene.frame_current
             frame_changed = visible_frame != original_frame
             lock_payload = None
@@ -654,24 +772,20 @@ class WONION_OT_toggle_world_lock(bpy.types.Operator):
                 # Try to get anchor from active layer's strokes
                 active_layer = gp_obj.data.layers.active
                 anchor_world = None
+                anchor_local = None
                 if active_layer is not None:
-                    anchor_world = calculate_anchor_from_strokes(gp_obj, active_layer, visible_frame)
+                    anchor_world, anchor_local = calculate_anchor_from_strokes(
+                        gp_obj, active_layer, visible_frame, return_local=True
+                    )
 
                 # Fallback to GP origin if no strokes
-                gp_origin_world = gp_obj.matrix_world.to_translation()
                 if anchor_world is None:
-                    anchor_world = gp_origin_world.copy()
+                    anchor_world = gp_obj.matrix_world.to_translation().copy()
+                    anchor_local = Vector((0, 0, 0))
 
-                # Calculate anchor offset in GP local coordinates
-                offset_world = anchor_world - gp_origin_world
-                anchor_local_offset = gp_obj.matrix_world.to_3x3().inverted() @ offset_world
-
-                matrix_local = gp_obj.matrix_local.copy()
+                # Use raw local anchor position (stable regardless of MPI)
+                anchor_local_offset, matrix_local = calculate_anchor_local_offset(gp_obj, anchor_local)
                 original_mpi = gp_obj.matrix_parent_inverse.copy()
-
-                print(f"anchor_world: {anchor_world}")
-                print(f"anchor_local_offset: {anchor_local_offset}")
-                print(f"matrix_local:\n{matrix_local}")
 
                 # Store the lock data captured from the visible keyframe
                 set_lock_for_frame(
@@ -702,7 +816,6 @@ class WONION_OT_toggle_world_lock(bpy.types.Operator):
             # Force update and verify anchor position stays fixed
             context.view_layer.update()
 
-            print(f"=== END LOCK DEBUG ===\n")
             self.report({'INFO'}, f"World lock ON for frame {visible_frame}")
 
         self._redraw_viewports(context)
@@ -748,19 +861,19 @@ class WONION_OT_toggle_world_lock(bpy.types.Operator):
 
                     # Calculate anchor for THIS frame's strokes
                     anchor_world = None
+                    anchor_local = None
                     if active_layer is not None:
-                        anchor_world = calculate_anchor_from_strokes(gp_obj, active_layer, frame_num)
+                        anchor_world, anchor_local = calculate_anchor_from_strokes(
+                            gp_obj, active_layer, frame_num, return_local=True
+                        )
 
                     # Fallback to GP origin if no strokes
-                    gp_origin_world = gp_obj.matrix_world.to_translation()
                     if anchor_world is None:
-                        anchor_world = gp_origin_world.copy()
+                        anchor_world = gp_obj.matrix_world.to_translation().copy()
+                        anchor_local = Vector((0, 0, 0))
 
-                    # Calculate anchor offset in GP local coordinates
-                    offset_world = anchor_world - gp_origin_world
-                    anchor_local_offset = gp_obj.matrix_world.to_3x3().inverted() @ offset_world
-
-                    matrix_local = gp_obj.matrix_local.copy()
+                    # Use raw local anchor position (stable regardless of MPI)
+                    anchor_local_offset, matrix_local = calculate_anchor_local_offset(gp_obj, anchor_local)
 
                     # Store frame-specific lock data
                     set_lock_for_frame(gp_obj, frame_num, anchor_world, anchor_local_offset, original_mpi, matrix_local)
@@ -794,7 +907,7 @@ class WONION_OT_toggle_world_lock(bpy.types.Operator):
 
 
 class WONION_OT_reload_addon(bpy.types.Operator):
-    """Reload the addon (for development)"""
+    """Reload the addon (for development) - robust version that handles GPU cleanup"""
     bl_idname = "world_onion.reload_addon"
     bl_label = "Reload Addon"
     bl_options = {'REGISTER'}
@@ -803,96 +916,227 @@ class WONION_OT_reload_addon(bpy.types.Operator):
         import importlib
         import sys
 
-        # Auto-detect addon name from this module's package
         addon_name = __package__.split('.')[0] if '.' in __package__ else __package__
-        print(f"Reloading addon: {addon_name}")
+        print(f"\n{'='*50}")
+        print(f"RELOADING ADDON: {addon_name}")
+        print(f"{'='*50}")
 
-        # Get the main module
         if addon_name not in sys.modules:
-            self.report({'ERROR'}, f"Addon module '{addon_name}' not found in sys.modules")
+            self.report({'ERROR'}, f"Addon module '{addon_name}' not found")
             return {'CANCELLED'}
 
         main_module = sys.modules[addon_name]
 
-        # Preserve current settings before unregister
-        saved_settings = {}
-        if hasattr(context.scene, 'world_onion'):
-            settings = context.scene.world_onion
-            saved_settings = {
-                'enabled': settings.enabled,
-                'mode': settings.mode,
-                'frames_before': settings.frames_before,
-                'frames_after': settings.frames_after,
-                'frame_step': settings.frame_step,
-                'opacity': settings.opacity,
-                'fill_opacity': getattr(settings, 'fill_opacity', 0.25),
-                'falloff': settings.falloff,
-                'color_before': tuple(settings.color_before),
-                'color_after': tuple(settings.color_after),
-                'line_width': settings.line_width,
-                'skip_underscore': settings.skip_underscore,
-                'layer_filter': settings.layer_filter,
-                'anchor_enabled': settings.anchor_enabled,
-                'anchor_auto_cursor': settings.anchor_auto_cursor,
-                'anchor_snap_to_stroke': settings.anchor_snap_to_stroke,
-                'anchor_show_indicators': settings.anchor_show_indicators,
-                'world_lock_inherit': settings.world_lock_inherit,
-            }
+        # Step 1: Save settings BEFORE any cleanup
+        saved_settings = self._save_settings(context)
 
-        # Step 1: Unregister the addon (cleanup handlers, classes, etc.)
+        # Step 2: Force cleanup of ALL GPU handlers and state BEFORE unregister
+        # This prevents crashes from stale GPU references
+        self._force_cleanup_gpu_handlers(addon_name)
+
+        # Step 3: Clear all module-level caches and state
+        self._clear_module_state(addon_name)
+
+        # Step 4: Unregister addon
         try:
             main_module.unregister()
+            print("  ✓ Unregistered addon")
         except Exception as e:
-            self.report({'WARNING'}, f"Unregister warning: {e}")
+            print(f"  ! Unregister warning: {e}")
 
-        # Step 2: Get all submodules to reload
-        modules_to_reload = [
-            name for name in sys.modules.keys()
-            if name.startswith(addon_name) and name != addon_name
-        ]
+        # Step 5: Get submodules in correct reload order (dependencies first)
+        modules_to_reload = self._get_ordered_submodules(addon_name)
 
-        # Sort to reload submodules first (deeper modules before shallower)
-        modules_to_reload.sort(key=lambda x: x.count('.'), reverse=True)
-
-        # Step 3: Reload all submodules
+        # Step 6: Reload all submodules
+        reload_count = 0
         for mod_name in modules_to_reload:
-            try:
-                importlib.reload(sys.modules[mod_name])
-            except Exception as e:
-                self.report({'WARNING'}, f"Failed to reload {mod_name}: {e}")
+            if mod_name in sys.modules:
+                try:
+                    importlib.reload(sys.modules[mod_name])
+                    reload_count += 1
+                except Exception as e:
+                    print(f"  ! Failed to reload {mod_name}: {e}")
 
-        # Step 4: Reload main module last (so it picks up reloaded submodules)
+        # Step 7: Reload main module
         try:
             importlib.reload(main_module)
+            reload_count += 1
+            print(f"  ✓ Reloaded {reload_count} modules")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to reload main module: {e}")
             return {'CANCELLED'}
 
-        # Step 5: Re-register the addon with fresh classes
+        # Step 8: Re-register
         try:
             main_module.register()
+            print("  ✓ Re-registered addon")
         except Exception as e:
             self.report({'ERROR'}, f"Failed to re-register: {e}")
             return {'CANCELLED'}
 
-        # Step 6: Restore saved settings
-        if saved_settings and hasattr(context.scene, 'world_onion'):
-            new_settings = context.scene.world_onion
-            for key, value in saved_settings.items():
-                try:
-                    if hasattr(new_settings, key):
-                        setattr(new_settings, key, value)
-                except Exception:
-                    pass  # Skip properties that fail (e.g., invalid object references)
+        # Step 9: Restore settings
+        self._restore_settings(context, saved_settings)
 
-        self.report({'INFO'}, f"Reloaded {len(modules_to_reload) + 1} modules")
+        # Step 10: Force redraw all areas
+        self._force_redraw_all(context)
 
-        # Redraw
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                area.tag_redraw()
+        print(f"{'='*50}")
+        print("RELOAD COMPLETE")
+        print(f"{'='*50}\n")
 
+        self.report({'INFO'}, f"Reloaded {reload_count} modules successfully")
         return {'FINISHED'}
+
+    def _save_settings(self, context):
+        """Save all current settings to restore after reload."""
+        saved = {}
+        if hasattr(context.scene, 'world_onion'):
+            settings = context.scene.world_onion
+            # Get all properties dynamically
+            for prop_name in dir(settings):
+                if prop_name.startswith('_') or prop_name.startswith('bl_'):
+                    continue
+                try:
+                    val = getattr(settings, prop_name)
+                    # Only save simple types
+                    if isinstance(val, (bool, int, float, str)):
+                        saved[prop_name] = val
+                    elif hasattr(val, '__iter__') and not isinstance(val, str):
+                        # Color/vector properties
+                        saved[prop_name] = tuple(val)
+                except Exception:
+                    pass
+        return saved
+
+    def _restore_settings(self, context, saved_settings):
+        """Restore saved settings after reload."""
+        if not saved_settings:
+            return
+        if not hasattr(context.scene, 'world_onion'):
+            return
+
+        new_settings = context.scene.world_onion
+        for key, value in saved_settings.items():
+            try:
+                if hasattr(new_settings, key):
+                    setattr(new_settings, key, value)
+            except Exception:
+                pass
+
+    def _force_cleanup_gpu_handlers(self, addon_name):
+        """Forcefully remove ALL draw handlers to prevent GPU crashes."""
+        import sys
+
+        # Clean up drawing.py handlers
+        drawing_module = f"{addon_name}.drawing"
+        if drawing_module in sys.modules:
+            drawing = sys.modules[drawing_module]
+            # Call unregister directly on the module
+            if hasattr(drawing, 'unregister_draw_handlers'):
+                try:
+                    drawing.unregister_draw_handlers()
+                    print("  ✓ Cleaned up viewport draw handlers")
+                except Exception as e:
+                    print(f"  ! Draw handler cleanup: {e}")
+            # Also clear any cached GPU batches/shaders
+            if hasattr(drawing, '_motion_path_cache'):
+                drawing._motion_path_cache = None
+            if hasattr(drawing, '_motion_path_dirty'):
+                drawing._motion_path_dirty = True
+
+        # Clean up timeline_drawing.py handlers
+        timeline_module = f"{addon_name}.timeline_drawing"
+        if timeline_module in sys.modules:
+            timeline = sys.modules[timeline_module]
+            if hasattr(timeline, 'unregister_timeline_handlers'):
+                try:
+                    timeline.unregister_timeline_handlers()
+                    print("  ✓ Cleaned up timeline draw handlers")
+                except Exception as e:
+                    print(f"  ! Timeline handler cleanup: {e}")
+
+        # Clean up handlers.py event handlers
+        handlers_module = f"{addon_name}.handlers"
+        if handlers_module in sys.modules:
+            handlers = sys.modules[handlers_module]
+            if hasattr(handlers, 'unregister_handlers'):
+                try:
+                    handlers.unregister_handlers()
+                    print("  ✓ Cleaned up event handlers")
+                except Exception as e:
+                    print(f"  ! Event handler cleanup: {e}")
+
+    def _clear_module_state(self, addon_name):
+        """Clear module-level caches and global state."""
+        import sys
+
+        # Clear cache
+        cache_module = f"{addon_name}.cache"
+        if cache_module in sys.modules:
+            cache = sys.modules[cache_module]
+            if hasattr(cache, 'clear_cache'):
+                try:
+                    cache.clear_cache()
+                except Exception:
+                    pass
+            if hasattr(cache, '_cache'):
+                cache._cache = {}
+
+        # Reset handler state
+        handlers_module = f"{addon_name}.handlers"
+        if handlers_module in sys.modules:
+            handlers = sys.modules[handlers_module]
+            for attr in ['_last_keyframe_set', '_last_active_layer_name',
+                         '_last_active_gp', '_in_depsgraph_handler']:
+                if hasattr(handlers, attr):
+                    try:
+                        if attr == '_last_keyframe_set':
+                            setattr(handlers, attr, set())
+                        elif attr == '_in_depsgraph_handler':
+                            setattr(handlers, attr, False)
+                        else:
+                            setattr(handlers, attr, None)
+                    except Exception:
+                        pass
+
+    def _get_ordered_submodules(self, addon_name):
+        """Get submodules in dependency order (leaves first, then parents)."""
+        import sys
+
+        submodules = [
+            name for name in sys.modules.keys()
+            if name.startswith(addon_name + '.') and name != addon_name
+        ]
+
+        # Order: deepest first, then by dependency
+        # transforms, cache, anchors, handlers, drawing, timeline_drawing, operators, settings, ui
+        priority = {
+            'transforms': 0,
+            'cache': 1,
+            'anchors': 2,
+            'handlers': 3,
+            'drawing': 4,
+            'timeline_drawing': 5,
+            'operators': 6,
+            'settings': 7,
+            'ui': 8,
+        }
+
+        def sort_key(mod_name):
+            base = mod_name.split('.')[-1]
+            return priority.get(base, 50)
+
+        submodules.sort(key=sort_key)
+        return submodules
+
+    def _force_redraw_all(self, context):
+        """Force redraw of all relevant areas."""
+        try:
+            for window in context.window_manager.windows:
+                for area in window.screen.areas:
+                    area.tag_redraw()
+        except Exception:
+            pass
 
 
 # List of operator classes for registration

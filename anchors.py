@@ -211,17 +211,25 @@ def migrate_anchor_data(gp_obj, layer_name, old_frame, new_frame):
         set_anchors(gp_obj, anchors)
 
 
-def calculate_anchor_from_strokes(gp_obj, layer, frame_number):
+def calculate_anchor_from_strokes(gp_obj, layer, frame_number, return_local=False):
     """Calculate anchor position from strokes: center XY, lowest Z.
 
-    IMPORTANT: Uses identity layer transform to get raw stroke positions
-    without any world lock compensation. This prevents circular dependency
-    where world lock sets layer.translation and anchor calculation uses it.
+    IMPORTANT: Computes anchor from RAW local stroke positions first,
+    then transforms to world. This ensures anchor_local is independent
+    of current matrix_world (and thus MPI), preventing circular dependency.
 
-    Returns Vector or None if no strokes found.
+    Args:
+        gp_obj: The GP object
+        layer: The layer to get strokes from
+        frame_number: Frame number to find keyframe
+        return_local: If True, returns (anchor_world, anchor_local) tuple
+
+    Returns:
+        If return_local=False: Vector (world position) or None
+        If return_local=True: (Vector world, Vector local) or (None, None)
     """
     if gp_obj is None or layer is None:
-        return None
+        return (None, None) if return_local else None
 
     # Find the keyframe
     keyframe = None
@@ -231,45 +239,52 @@ def calculate_anchor_from_strokes(gp_obj, layer, frame_number):
             break
 
     if keyframe is None or keyframe.drawing is None:
-        return None
+        return (None, None) if return_local else None
 
     drawing = keyframe.drawing
 
     if not hasattr(drawing, 'attributes') or 'position' not in drawing.attributes:
-        return None
+        return (None, None) if return_local else None
 
     pos_attr = drawing.attributes['position']
     if len(pos_attr.data) == 0:
-        return None
+        return (None, None) if return_local else None
 
-    # Get world matrix WITHOUT layer transform
-    # This gives raw stroke positions, unaffected by world lock compensation
-    # DO NOT use layer_matrix here - it contains world lock offset
-    world_matrix = gp_obj.matrix_world
-    full_matrix = world_matrix  # Raw positions only
-    
-    # Collect all world-space points
-    min_z = float('inf')
-    sum_x = 0.0
-    sum_y = 0.0
+    # Compute anchor in LOCAL coordinates first (independent of matrix_world)
+    local_min_z = float('inf')
+    local_sum_x = 0.0
+    local_sum_y = 0.0
     count = 0
-    
+
     for p in pos_attr.data:
         local_pos = Vector(p.vector)
-        world_pos = full_matrix @ local_pos
-        
-        sum_x += world_pos.x
-        sum_y += world_pos.y
-        if world_pos.z < min_z:
-            min_z = world_pos.z
+        local_sum_x += local_pos.x
+        local_sum_y += local_pos.y
+        if local_pos.z < local_min_z:
+            local_min_z = local_pos.z
         count += 1
-    
+
     if count == 0:
-        return None
-    
-    # Center XY, lowest Z
-    anchor = Vector((sum_x / count, sum_y / count, min_z))
-    return anchor
+        return (None, None) if return_local else None
+
+    # Anchor in local coordinates (stable regardless of MPI)
+    anchor_local = Vector((local_sum_x / count, local_sum_y / count, local_min_z))
+
+    # Transform anchor_local to world coordinates using CURRENT matrix_world.
+    # This gives the ACTUAL world position of the anchor (where strokes are displayed).
+    #
+    # IMPORTANT: We use matrix_world directly (not R_desired formula) because:
+    # - On a keyframe: matrix_world reflects the locked position
+    # - On interpolated frame: matrix_world reflects interpolated position
+    # - Either way, this gives WHERE STROKES ACTUALLY ARE on screen
+    #
+    # The R_desired formula (camera_rot @ local_rot) is only used in
+    # apply_world_lock_from_stored for the billboard effect, not here.
+    anchor_world = gp_obj.matrix_world @ anchor_local
+
+    if return_local:
+        return anchor_world, anchor_local
+    return anchor_world
 
 
 def get_current_keyframes_set(gp_obj, settings):
@@ -540,7 +555,6 @@ def set_object_lock_data(gp_obj, data):
 
     # Invalidate motion path cache (late import to avoid circular dependency)
     from .drawing import invalidate_motion_path
-    print(f"[LOCK] Lock data changed. Frames: {list(data.keys())}")
     invalidate_motion_path()
 
     # Trigger viewport redraw so motion path updates visually
@@ -1013,3 +1027,31 @@ def migrate_object_lock_frame(gp_obj, old_frame, new_frame):
         lock_data[new_frame_str] = lock_data[old_frame_str]
         del lock_data[old_frame_str]
         set_object_lock_data(gp_obj, lock_data)
+
+
+def calculate_anchor_local_offset(gp_obj, anchor_local):
+    """Return anchor_local_offset for storage with the lock.
+
+    The anchor_local should come directly from stroke local coordinates
+    (via calculate_anchor_from_strokes with return_local=True), NOT from
+    inverse-transforming a world position. This ensures the offset is
+    stable regardless of current MPI/matrix_world state.
+
+    At apply time, the formula is:
+        gp_position = anchor_world - R_desired @ anchor_local_offset
+    This places GP origin such that anchor stays at anchor_world.
+
+    Args:
+        gp_obj: The GP object
+        anchor_local: Vector - anchor position in raw stroke local coordinates
+
+    Returns:
+        (anchor_local_offset, matrix_local) tuple where:
+        - anchor_local_offset: Vector - the anchor in local coordinates
+        - matrix_local: Matrix - the matrix_local to store with the lock
+    """
+    matrix_local = gp_obj.matrix_local.copy()
+
+    # anchor_local is already in the correct coordinate space
+    # (raw stroke local coords, independent of MPI)
+    return anchor_local.copy(), matrix_local
