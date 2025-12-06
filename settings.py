@@ -267,3 +267,11 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         default=False,
         update=update_setting,
     )
+
+    # Depth interaction (shrinkwrap) - strokes follow mesh surface
+    depth_interaction_enabled: bpy.props.BoolProperty(
+        name="Shrinkwrap",
+        description="Motion path and strokes automatically follow mesh surfaces below them",
+        default=False,
+        update=update_setting,
+    )

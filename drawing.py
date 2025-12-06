@@ -28,6 +28,50 @@ def invalidate_motion_path():
     _motion_path_dirty = True
 
 
+def adjust_path_points_to_mesh(points, scene):
+    """Adjust path points to sit on mesh surface (shrinkwrap effect).
+
+    For each point, casts a ray straight down to find any mesh surface,
+    then adjusts Z to be on that surface plus a small offset for visibility.
+
+    Args:
+        points: List of (x, y, z) tuples
+        scene: Current scene
+
+    Returns:
+        List of adjusted (x, y, z) tuples
+    """
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    except (RuntimeError, AttributeError):
+        return points
+
+    # Small offset to ensure path sits visibly on top of mesh
+    SURFACE_OFFSET = 0.01
+
+    adjusted_points = []
+    for pt in points:
+        x, y, z = pt
+
+        # Cast ray straight down from high above
+        ray_origin = Vector((x, y, z + 1000))
+        ray_dir = Vector((0, 0, -1))
+
+        hit, location, normal, index, hit_obj, matrix = scene.ray_cast(
+            depsgraph, ray_origin, ray_dir
+        )
+
+        if hit:
+            # Adjust Z to be on mesh surface + small offset
+            new_z = location.z + SURFACE_OFFSET
+            adjusted_points.append((x, y, new_z))
+        else:
+            # No hit - keep original
+            adjusted_points.append(pt)
+
+    return adjusted_points
+
+
 def get_draw_handlers():
     """Get current draw handler references."""
     return _draw_handler, _anchor_draw_handler
@@ -465,9 +509,13 @@ def draw_motion_path_callback():
     else:
         draw_points = path_points
 
-    # Set up GPU state - disable depth test so motion path is always on top
+    # Apply depth interaction (clingwrap) - adjust points to mesh surface
+    if settings.depth_interaction_enabled:
+        draw_points = adjust_path_points_to_mesh(draw_points, scene)
+
+    # Set up GPU state
     gpu.state.blend_set('ALPHA')
-    gpu.state.depth_test_set('NONE')
+    gpu.state.depth_test_set('LESS_EQUAL')
     gpu.state.depth_mask_set(False)
 
     color = tuple(settings.motion_path_color)

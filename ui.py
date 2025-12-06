@@ -212,6 +212,11 @@ class WONION_PT_anchors(bpy.types.Panel):
 
         layout.separator()
 
+        # Shrinkwrap - strokes follow mesh surface
+        layout.prop(settings, "depth_interaction_enabled")
+
+        layout.separator()
+
         row = layout.row(align=True)
         row.operator("world_onion.auto_anchor", text="Auto", icon='CON_LOCLIKE')
         row.operator("world_onion.set_anchor", text="Cursor", icon='PINNED')

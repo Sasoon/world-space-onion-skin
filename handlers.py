@@ -58,6 +58,45 @@ def reset_last_active_gp():
     _last_active_gp = None
 
 
+def adjust_anchor_for_depth(anchor_world, scene):
+    """Adjust anchor position to sit on mesh surface (shrinkwrap effect).
+
+    Casts a ray straight down from above the anchor. If any mesh is found,
+    projects the anchor onto that surface plus a small offset.
+
+    Args:
+        anchor_world: Vector - world position of anchor
+        scene: The current scene
+
+    Returns:
+        Vector - adjusted anchor position (or original if no hit)
+    """
+    # Ensure anchor_world is a Vector
+    if isinstance(anchor_world, list):
+        anchor_world = Vector(anchor_world)
+
+    # Cast ray straight down from high above the anchor position
+    ray_origin = Vector((anchor_world.x, anchor_world.y, anchor_world.z + 1000))
+    ray_dir = Vector((0, 0, -1))  # Straight down
+
+    # Ray cast against scene
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    except (RuntimeError, AttributeError):
+        return anchor_world
+
+    hit, location, normal, index, hit_obj, matrix = scene.ray_cast(
+        depsgraph, ray_origin, ray_dir
+    )
+
+    if hit:
+        # Small offset to ensure strokes sit visibly on top of mesh
+        SURFACE_OFFSET = 0.01
+        return Vector((anchor_world.x, anchor_world.y, location.z + SURFACE_OFFSET))
+
+    return anchor_world
+
+
 # =============================================================================
 # OBJECT-LEVEL WORLD LOCK SYSTEM
 # =============================================================================
@@ -177,6 +216,11 @@ def apply_object_world_lock_for_frame(gp_obj, scene):
                     anchor_local_offset = prev_data["anchor_local_offset"]
                     matrix_local = prev_data["matrix_local"]
 
+            # Apply shrinkwrap adjustment if enabled
+            if settings.depth_interaction_enabled:
+                adjusted = adjust_anchor_for_depth(anchor_world, scene)
+                anchor_world = [adjusted.x, adjusted.y, adjusted.z]
+
             # Apply world lock with pivot-based billboard effect
             apply_world_lock_from_stored(
                 gp_obj,
@@ -198,6 +242,11 @@ def apply_object_world_lock_for_frame(gp_obj, scene):
             anchor_world = [interp_pos.x, interp_pos.y, interp_pos.z]
             anchor_local_offset = prev_data["anchor_local_offset"]
             matrix_local = prev_data["matrix_local"]
+
+            # Apply shrinkwrap adjustment if enabled
+            if settings.depth_interaction_enabled:
+                adjusted = adjust_anchor_for_depth(anchor_world, scene)
+                anchor_world = [adjusted.x, adjusted.y, adjusted.z]
 
             apply_world_lock_from_stored(
                 gp_obj,
