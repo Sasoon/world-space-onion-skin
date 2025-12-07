@@ -5,7 +5,7 @@ Operators for world-space onion skinning.
 import bpy
 from mathutils import Vector, Matrix
 
-from .cache import clear_cache, get_cache, cache_current_frame, get_cache_stats, get_active_gp
+from .cache import clear_cache, get_cache, get_cache_stats, get_active_gp
 from .anchors import (
     get_anchors,
     set_anchors,
@@ -16,6 +16,7 @@ from .anchors import (
     get_current_keyframes_set,
     get_visible_keyframe,
     calculate_anchor_local_offset,
+    get_all_locked_frames,
     # Object-level lock functions
     is_object_locked_at_frame,
     get_lock_for_frame,
@@ -34,7 +35,7 @@ class WONION_OT_clear_cache(bpy.types.Operator):
     """Clear the onion skin cache"""
     bl_idname = "world_onion.clear_cache"
     bl_label = "Clear Cache"
-    bl_options = {'REGISTER'}
+    bl_options = {'REGISTER', 'UNDO'}
     
     def execute(self, context):
         cache = get_cache()
@@ -53,7 +54,7 @@ class WONION_OT_build_cache(bpy.types.Operator):
     """Scrub through timeline to build cache and calculate anchors"""
     bl_idname = "world_onion.build_cache"
     bl_label = "Build Full Cache"
-    bl_options = {'REGISTER'}
+    bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
@@ -162,9 +163,13 @@ class WONION_OT_set_anchor(bpy.types.Operator):
         created_new_kf = False
         if active_kf.frame_number != current_frame:
             # Copy the keyframe to current frame (API: copy(from_frame, to_frame))
-            new_kf = active_layer.frames.copy(active_kf.frame_number, current_frame)
-            active_kf = new_kf
-            created_new_kf = True
+            try:
+                new_kf = active_layer.frames.copy(active_kf.frame_number, current_frame)
+                active_kf = new_kf
+                created_new_kf = True
+            except RuntimeError as e:
+                self.report({'WARNING'}, f"Could not create keyframe: {e}")
+                return {'CANCELLED'}
 
         # Set anchor at cursor position
         cursor_pos = scene.cursor.location.copy()
@@ -267,9 +272,13 @@ class WONION_OT_auto_anchor(bpy.types.Operator):
         created_new_kf = False
         if active_kf.frame_number != current_frame:
             # Copy the keyframe to current frame (API: copy(from_frame, to_frame))
-            new_kf = active_layer.frames.copy(active_kf.frame_number, current_frame)
-            active_kf = new_kf
-            created_new_kf = True
+            try:
+                new_kf = active_layer.frames.copy(active_kf.frame_number, current_frame)
+                active_kf = new_kf
+                created_new_kf = True
+            except RuntimeError as e:
+                self.report({'WARNING'}, f"Could not create keyframe: {e}")
+                return {'CANCELLED'}
 
         # Capture camera direction
         cam_dir = get_camera_direction(scene)
@@ -284,7 +293,6 @@ class WONION_OT_auto_anchor(bpy.types.Operator):
         if not is_object_locked_at_frame(gp_obj, active_kf.frame_number):
             # This frame isn't locked yet - find the source locked frame's matrix_local
             # Use frame BEFORE current to find the source (since current frame now has a keyframe)
-            from .anchors import get_all_locked_frames, get_lock_for_frame
             locked_frames = get_all_locked_frames(gp_obj)
             # Find the locked frame at or before current frame
             source_locked_frame = None
@@ -302,7 +310,6 @@ class WONION_OT_auto_anchor(bpy.types.Operator):
             matrix_local = source_matrix_local
 
         # Get original MPI to store (for unlock restore)
-        from .anchors import get_object_lock_data
         lock_data = get_object_lock_data(gp_obj)
         original_mpi = None
         for frame_str, data in lock_data.items():
@@ -430,9 +437,6 @@ class WONION_OT_clear_all_locks(bpy.types.Operator):
         return get_active_gp(context) is not None
 
     def execute(self, context):
-        from .anchors import set_object_lock_data
-        from .handlers import reset_object_world_lock
-
         gp_obj = get_active_gp(context)
 
         if gp_obj is None:
@@ -466,10 +470,6 @@ class WONION_OT_reset_test_state(bpy.types.Operator):
         return get_active_gp(context) is not None
 
     def execute(self, context):
-        from .anchors import set_object_lock_data, set_anchors
-        from .handlers import reset_object_world_lock
-        from mathutils import Matrix
-
         gp_obj = get_active_gp(context)
 
         if gp_obj is None:
@@ -558,7 +558,11 @@ class WONION_OT_snap_to_cursor(bpy.types.Operator):
         created_new_kf = False
         if active_kf.frame_number != current_frame:
             # Copy the keyframe to current frame (API: copy(from_frame, to_frame))
-            new_kf = active_layer.frames.copy(active_kf.frame_number, current_frame)
+            try:
+                new_kf = active_layer.frames.copy(active_kf.frame_number, current_frame)
+            except RuntimeError as e:
+                self.report({'WARNING'}, f"Could not create keyframe: {e}")
+                return {'CANCELLED'}
             active_kf = new_kf
             created_new_kf = True
             # Get drawing from new keyframe
@@ -631,7 +635,6 @@ class WONION_OT_snap_to_cursor(bpy.types.Operator):
         source_matrix_local = None
         if not is_object_locked_at_frame(gp_obj, active_kf.frame_number):
             # This frame isn't locked yet - find the source locked frame's matrix_local
-            from .anchors import get_all_locked_frames
             locked_frames = get_all_locked_frames(gp_obj)
             # Find the locked frame before current frame
             source_locked_frame = None
@@ -653,7 +656,6 @@ class WONION_OT_snap_to_cursor(bpy.types.Operator):
             update_lock_anchor(gp_obj, active_kf.frame_number, cursor_pos, anchor_local_offset, matrix_local)
         else:
             # Get original MPI from existing locks (for unlock restore)
-            from .anchors import get_object_lock_data
             lock_data = get_object_lock_data(gp_obj)
             original_mpi = None
             for frame_str, data in lock_data.items():

@@ -1,6 +1,6 @@
 # World Space Onion Skin - Developer Documentation
 
-> **Version:** 9.1.0 | **Blender:** 4.5+ | **Authors:** Claude + Sasoon
+> **Version:** 9.1.0 (cleanup build) | **Blender:** 4.5+ | **Authors:** Claude + Sasoon
 
 ## What This Addon Does
 

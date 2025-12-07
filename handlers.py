@@ -6,7 +6,7 @@ import bpy
 from bpy.app.handlers import persistent
 from mathutils import Vector, Matrix
 
-from .cache import cache_current_frame, clear_cache, get_cache, get_active_gp, get_all_world_locked_gp_objects
+from .cache import cache_current_frame, clear_cache, get_active_gp, get_all_world_locked_gp_objects
 from .anchors import (
     get_anchor_for_frame,
     set_anchor_for_frame,
@@ -123,13 +123,18 @@ def apply_world_lock_from_stored(gp_obj, anchor_world, anchor_local_offset, matr
     if gp_obj is None:
         return
 
-    # Convert from list if needed
+    # Convert from list if needed (with validation)
     if isinstance(anchor_world, list):
         anchor_world = Vector(anchor_world)
     if isinstance(anchor_local_offset, list):
         anchor_local_offset = Vector(anchor_local_offset)
     if isinstance(matrix_local_stored, list):
-        matrix_local_stored = Matrix(matrix_local_stored)
+        # Validate 4x4 matrix structure before conversion
+        if len(matrix_local_stored) == 4 and all(len(row) == 4 for row in matrix_local_stored):
+            matrix_local_stored = Matrix(matrix_local_stored)
+        else:
+            # Invalid matrix data - use identity
+            matrix_local_stored = Matrix.Identity(4)
 
     parent = gp_obj.parent
     if parent is None:
@@ -228,9 +233,16 @@ def apply_object_world_lock_for_frame(gp_obj, scene):
     # Step 4: Check if visible keyframe is LOCKED
     if isinstance(frame_data, dict) and frame_data.get("world_locked", False):
         # Visible keyframe is locked - apply lock with interpolation
-        anchor_world = frame_data["anchor_world"]
-        anchor_local_offset = frame_data["anchor_local_offset"]
-        matrix_local = frame_data["matrix_local"]
+        # Use .get() to handle potentially corrupted/incomplete lock data
+        anchor_world = frame_data.get("anchor_world")
+        anchor_local_offset = frame_data.get("anchor_local_offset")
+        matrix_local = frame_data.get("matrix_local")
+
+        # Validate required fields exist
+        if anchor_world is None or anchor_local_offset is None or matrix_local is None:
+            # Corrupted lock data - reset to default behavior
+            reset_object_world_lock(gp_obj, frame_data.get("original_parent_inverse"))
+            return
 
         # Track if we're interpolating (vs on exact keyframe)
         is_interpolating = False

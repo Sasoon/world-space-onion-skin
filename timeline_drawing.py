@@ -15,6 +15,17 @@ from .anchors import get_all_locked_frames
 
 _timeline_draw_handler = None
 
+# Cached shader (lazy initialized)
+_timeline_shader = None
+
+
+def _get_timeline_shader():
+    """Get cached UNIFORM_COLOR shader for timeline drawing."""
+    global _timeline_shader
+    if _timeline_shader is None:
+        _timeline_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    return _timeline_shader
+
 
 def get_lane_center_y(context, lane_index):
     """Return the view-space Y coordinate for the centre of a dopesheet lane.
@@ -45,16 +56,10 @@ def get_lane_center_y(context, lane_index):
     
     # Distance to top of the requested lane
     lane_top_y = -ruler_height - (lane_index * channel_step)
-    
+
     # Center of the lane (middle of the channel step)
     center_y = lane_top_y - (channel_step / 2.0)
-    
-    # Fine-tuning:
-    # -23 - 9 = -32 (Too high)
-    # -24 - 9 - 1 = -34 (Too low)
-    # -24 - 9 = -33 (Target)
-    # We remove the extra 1px offset to sit exactly between the previous two attempts.
-    
+
     return center_y
 
 
@@ -181,7 +186,7 @@ def draw_lock_indicators(context, area, region, gp_obj, settings):
             # Name filter
             if dopesheet.filter_text:
                 # Simple case-insensitive containment check
-                if dopesheet.filter_text.lower() not in l.info.lower():
+                if dopesheet.filter_text.lower() not in l.name.lower():
                     continue
         
         visible_layers.append(l)
@@ -203,7 +208,7 @@ def draw_lock_indicators(context, area, region, gp_obj, settings):
     view_max_y = view2d.region_to_view(0, region.height)[1]
     view_height = abs(view_max_y - view_min_y)
 
-    if view_height > 0:
+    if view_height > 0 and region.height > 0:
         view_units_per_pixel = view_height / region.height
     else:
         view_units_per_pixel = 0.05  # fallback
@@ -216,7 +221,7 @@ def draw_lock_indicators(context, area, region, gp_obj, settings):
     # Set up GPU state
     gpu.state.blend_set('ALPHA')
 
-    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    shader = _get_timeline_shader()  # Use cached shader
     shader.bind()
     shader.uniform_float("color", color)
 

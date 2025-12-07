@@ -8,7 +8,8 @@ from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 
 from .cache import get_cache, get_active_gp
-from .anchors import get_all_anchor_positions, get_all_locked_frames, get_lock_for_frame, get_interpolated_position
+from .anchors import get_all_anchor_positions, get_all_locked_frames, get_interpolated_position
+from .transforms import SURFACE_OFFSET, catmull_rom_point
 
 
 # Draw handler references
@@ -20,6 +21,26 @@ _motion_path_handler = None
 _motion_path_cache = None  # List of (x, y, z) tuples
 _motion_path_cache_gp = None  # GP object the cache is for
 _motion_path_dirty = True
+
+# Cached shaders (lazy initialized to avoid GPU calls at import time)
+_stroke_shader = None
+_fill_shader = None
+
+
+def _get_stroke_shader():
+    """Get cached POLYLINE_UNIFORM_COLOR shader."""
+    global _stroke_shader
+    if _stroke_shader is None:
+        _stroke_shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+    return _stroke_shader
+
+
+def _get_fill_shader():
+    """Get cached UNIFORM_COLOR shader."""
+    global _fill_shader
+    if _fill_shader is None:
+        _fill_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    return _fill_shader
 
 
 def invalidate_motion_path():
@@ -45,9 +66,6 @@ def adjust_path_points_to_mesh(points, scene):
         depsgraph = bpy.context.evaluated_depsgraph_get()
     except (RuntimeError, AttributeError):
         return points
-
-    # Small offset to ensure path sits visibly on top of mesh
-    SURFACE_OFFSET = 0.01
 
     adjusted_points = []
     for pt in points:
@@ -113,122 +131,132 @@ def draw_onion_callback():
     if not frames_to_show:
         return
 
-    # Set up GPU state
-    stroke_shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
-    fill_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    # Set up GPU state (use cached shaders for performance)
+    stroke_shader = _get_stroke_shader()
+    fill_shader = _get_fill_shader()
 
     gpu.state.blend_set('ALPHA')
     gpu.state.depth_test_set('LESS_EQUAL')
     gpu.state.depth_mask_set(False)
 
-    # Get viewport dimensions for line width
-    region = bpy.context.region
+    try:
+        # Get viewport dimensions for line width
+        region = bpy.context.region
 
-    # Draw each cached frame
-    for frame_offset, frame in frames_to_show:
-        if frame not in cache:
-            continue
-        if frame == current_frame:
-            continue
+        # Bind shaders once for the entire draw operation
+        stroke_shader.bind()
+        stroke_shader.uniform_float("viewportSize", (region.width, region.height))
+        stroke_shader.uniform_float("lineWidth", settings.line_width)
 
-        strokes = cache[frame]
-        if not strokes:
-            continue
-
-        # Compute offset to position strokes correctly on motion path
-        offset = Vector((0, 0, 0))
-
-        # Check if interpolation is enabled - use motion path positions
-        if settings.interpolation_enabled:
-            # Get current position on motion path for this frame
-            interp_pos, interp_info = get_interpolated_position(gp_obj, frame)
-
-            if interp_pos is None:
-                # Frame is outside locked range - skip it
+        # Draw each cached frame
+        for frame_offset, frame in frames_to_show:
+            if frame not in cache:
+                continue
+            if frame == current_frame:
                 continue
 
-            # Compute anchor position of cached strokes (center X/Y, min Z)
-            all_points = []
+            strokes = cache[frame]
+            if not strokes:
+                continue
+
+            # Compute offset to position strokes correctly on motion path
+            offset = Vector((0, 0, 0))
+
+            # Check if interpolation is enabled - use motion path positions
+            if settings.interpolation_enabled:
+                # Get current position on motion path for this frame
+                interp_pos, interp_info = get_interpolated_position(gp_obj, frame)
+
+                if interp_pos is None:
+                    # Frame is outside locked range - skip it
+                    continue
+
+                # Compute anchor position of cached strokes (center X/Y, min Z)
+                all_points = []
+                for stroke_data in strokes:
+                    all_points.extend(stroke_data['points'])
+
+                if all_points:
+                    sum_x, sum_y = 0.0, 0.0
+                    min_z = float('inf')
+                    for p in all_points:
+                        sum_x += p.x
+                        sum_y += p.y
+                        min_z = min(min_z, p.z)
+                    n = len(all_points)
+                    cached_anchor = Vector((sum_x / n, sum_y / n, min_z))
+
+                    # Offset from cached anchor to motion path position
+                    offset = interp_pos - cached_anchor
+
+            # Calculate color based on before/after
+            if frame < current_frame:
+                base_color = settings.color_before
+            else:
+                base_color = settings.color_after
+
+            # Calculate opacity with falloff
+            abs_offset = abs(frame_offset)
+            max_offset = max(settings.frames_before, settings.frames_after, 1)
+
+            if settings.falloff > 0:
+                falloff_factor = 1.0 - (abs_offset / max_offset) * settings.falloff
+            else:
+                falloff_factor = 1.0
+
+            # Fill uses fill_opacity setting
+            fill_alpha = settings.fill_opacity * max(0.1, falloff_factor)
+            fill_color = (base_color[0], base_color[1], base_color[2], fill_alpha)
+
+            # Stroke uses opacity setting
+            stroke_alpha = settings.opacity * max(0.1, falloff_factor)
+            stroke_color = (base_color[0], base_color[1], base_color[2], stroke_alpha)
+
+            # PASS 1: Draw fills first (underneath strokes)
+            # Bind fill shader once per frame with current color
+            fill_shader.bind()
+            fill_shader.uniform_float("color", fill_color)
+
             for stroke_data in strokes:
-                all_points.extend(stroke_data['points'])
+                fill_triangles = stroke_data.get('fill_triangles', [])
+                if fill_triangles:
+                    # Apply offset for locked frames
+                    points = stroke_data['points']
+                    coords = [(p.x + offset.x, p.y + offset.y, p.z + offset.z) for p in points]
 
-            if all_points:
-                sum_x, sum_y = 0.0, 0.0
-                min_z = float('inf')
-                for p in all_points:
-                    sum_x += p.x
-                    sum_y += p.y
-                    min_z = min(min_z, p.z)
-                n = len(all_points)
-                cached_anchor = Vector((sum_x / n, sum_y / n, min_z))
+                    # Build triangle vertex list from indices
+                    tri_coords = []
+                    for i, j, k in fill_triangles:
+                        if i < len(coords) and j < len(coords) and k < len(coords):
+                            tri_coords.extend([coords[i], coords[j], coords[k]])
 
-                # Offset from cached anchor to motion path position
-                offset = interp_pos - cached_anchor
+                    if tri_coords:
+                        batch = batch_for_shader(fill_shader, 'TRIS', {"pos": tri_coords})
+                        batch.draw(fill_shader)
 
-        # Calculate color based on before/after
-        if frame < current_frame:
-            base_color = settings.color_before
-        else:
-            base_color = settings.color_after
+            # PASS 2: Draw strokes on top
+            # Re-bind stroke shader with current color (viewport/lineWidth already set)
+            stroke_shader.bind()
+            stroke_shader.uniform_float("viewportSize", (region.width, region.height))
+            stroke_shader.uniform_float("lineWidth", settings.line_width)
+            stroke_shader.uniform_float("color", stroke_color)
 
-        # Calculate opacity with falloff
-        abs_offset = abs(frame_offset)
-        max_offset = max(settings.frames_before, settings.frames_after, 1)
-
-        if settings.falloff > 0:
-            falloff_factor = 1.0 - (abs_offset / max_offset) * settings.falloff
-        else:
-            falloff_factor = 1.0
-
-        # Fill uses fill_opacity setting
-        fill_alpha = settings.fill_opacity * max(0.1, falloff_factor)
-        fill_color = (base_color[0], base_color[1], base_color[2], fill_alpha)
-
-        # Stroke uses opacity setting
-        stroke_alpha = settings.opacity * max(0.1, falloff_factor)
-        stroke_color = (base_color[0], base_color[1], base_color[2], stroke_alpha)
-
-        # PASS 1: Draw fills first (underneath strokes)
-        for stroke_data in strokes:
-            fill_triangles = stroke_data.get('fill_triangles', [])
-            if fill_triangles:
+            for stroke_data in strokes:
                 # Apply offset for locked frames
                 points = stroke_data['points']
                 coords = [(p.x + offset.x, p.y + offset.y, p.z + offset.z) for p in points]
 
-                # Build triangle vertex list from indices
-                tri_coords = []
-                for i, j, k in fill_triangles:
-                    if i < len(coords) and j < len(coords) and k < len(coords):
-                        tri_coords.extend([coords[i], coords[j], coords[k]])
+                if len(coords) < 2:
+                    continue
 
-                if tri_coords:
-                    batch = batch_for_shader(fill_shader, 'TRIS', {"pos": tri_coords})
-                    fill_shader.bind()
-                    fill_shader.uniform_float("color", fill_color)
-                    batch.draw(fill_shader)
+                batch = batch_for_shader(stroke_shader, 'LINE_STRIP', {"pos": coords})
+                batch.draw(stroke_shader)
 
-        # PASS 2: Draw strokes on top
-        stroke_shader.uniform_float("viewportSize", (region.width, region.height))
-        stroke_shader.uniform_float("lineWidth", settings.line_width)
-
-        for stroke_data in strokes:
-            # Apply offset for locked frames
-            points = stroke_data['points']
-            coords = [(p.x + offset.x, p.y + offset.y, p.z + offset.z) for p in points]
-
-            if len(coords) < 2:
-                continue
-
-            batch = batch_for_shader(stroke_shader, 'LINE_STRIP', {"pos": coords})
-            stroke_shader.bind()
-            stroke_shader.uniform_float("color", stroke_color)
-            batch.draw(stroke_shader)
-
-    # Reset GPU state
-    gpu.state.blend_set('NONE')
-    gpu.state.depth_test_set('NONE')
-    gpu.state.depth_mask_set(True)
+    finally:
+        # Reset GPU state (always runs, even if exception occurs)
+        gpu.state.blend_set('NONE')
+        gpu.state.depth_test_set('NONE')
+        gpu.state.depth_mask_set(True)
 
 
 def get_keyframe_based_frames(gp_obj, settings, current_frame):
@@ -332,17 +360,19 @@ def draw_anchor_callback():
 
     # Get all anchor positions
     anchor_data = get_all_anchor_positions(gp_obj, settings)
-    
+
     if not anchor_data:
         return
-    
-    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
-    
+
+    shader = _get_fill_shader()  # Use cached shader
+
     gpu.state.blend_set('ALPHA')
     gpu.state.point_size_set(12.0)
     gpu.state.depth_test_set('LESS_EQUAL')
     gpu.state.depth_mask_set(False)
-    
+
+    shader.bind()  # Bind once at start
+
     # Draw each anchor
     for pos, is_current in anchor_data:
         if is_current:
@@ -351,11 +381,10 @@ def draw_anchor_callback():
         else:
             # Other anchors - dimmer
             color = (0.8, 0.6, 0.0, 0.4)
-        
+
         # Draw as a point
-        batch = batch_for_shader(shader, 'POINTS', {"pos": [pos]})
-        shader.bind()
         shader.uniform_float("color", color)
+        batch = batch_for_shader(shader, 'POINTS', {"pos": [pos]})
         batch.draw(shader)
         
         # Draw a small cross for visibility
@@ -370,7 +399,6 @@ def draw_anchor_callback():
         ]
         batch = batch_for_shader(shader, 'LINES', {"pos": cross_lines})
         gpu.state.line_width_set(2.0 if is_current else 1.0)
-        shader.bind()
         shader.uniform_float("color", color)
         batch.draw(shader)
     
@@ -379,70 +407,7 @@ def draw_anchor_callback():
     gpu.state.depth_test_set('NONE')
     gpu.state.depth_mask_set(True)
     gpu.state.line_width_set(1.0)
-
-
-def catmull_rom_spline(points, subdivisions):
-    """Generate smooth curve through points using Catmull-Rom interpolation.
-
-    Args:
-        points: List of (x, y, z) tuples - control points
-        subdivisions: Number of subdivisions between each pair of points
-
-    Returns:
-        List of (x, y, z) tuples - smoothed curve points
-    """
-    if len(points) < 2:
-        return points
-
-    if subdivisions <= 0:
-        return points
-
-    result = []
-
-    # For Catmull-Rom, we need 4 points: p0, p1, p2, p3
-    # We interpolate between p1 and p2
-    # For endpoints, duplicate first/last points
-
-    n = len(points)
-    for i in range(n - 1):
-        # Get 4 control points (duplicate at boundaries)
-        p0 = points[max(0, i - 1)]
-        p1 = points[i]
-        p2 = points[min(n - 1, i + 1)]
-        p3 = points[min(n - 1, i + 2)]
-
-        # Add the starting point
-        if i == 0:
-            result.append(p1)
-
-        # Interpolate between p1 and p2
-        for j in range(1, subdivisions + 1):
-            t = j / (subdivisions + 1)
-            t2 = t * t
-            t3 = t2 * t
-
-            # Catmull-Rom matrix coefficients
-            x = 0.5 * ((2 * p1[0]) +
-                      (-p0[0] + p2[0]) * t +
-                      (2*p0[0] - 5*p1[0] + 4*p2[0] - p3[0]) * t2 +
-                      (-p0[0] + 3*p1[0] - 3*p2[0] + p3[0]) * t3)
-
-            y = 0.5 * ((2 * p1[1]) +
-                      (-p0[1] + p2[1]) * t +
-                      (2*p0[1] - 5*p1[1] + 4*p2[1] - p3[1]) * t2 +
-                      (-p0[1] + 3*p1[1] - 3*p2[1] + p3[1]) * t3)
-
-            z = 0.5 * ((2 * p1[2]) +
-                      (-p0[2] + p2[2]) * t +
-                      (2*p0[2] - 5*p1[2] + 4*p2[2] - p3[2]) * t2 +
-                      (-p0[2] + 3*p1[2] - 3*p2[2] + p3[2]) * t3)
-
-            result.append((x, y, z))
-
-        # Add endpoint of this segment
-        result.append(p2)
-
-    return result
+    gpu.state.point_size_set(1.0)
 
 
 def draw_motion_path_callback():
@@ -600,70 +565,48 @@ def draw_motion_path_callback():
     inactive_color = (0.9, 0.2, 0.2, color[3] * 0.8)
     region = bpy.context.region
 
-    line_shader = gpu.shader.from_builtin('POLYLINE_UNIFORM_COLOR')
+    line_shader = _get_stroke_shader()  # Use cached shader
+    line_shader.bind()  # Bind once
     line_shader.uniform_float("viewportSize", (region.width, region.height))
     line_shader.uniform_float("lineWidth", settings.motion_path_width)
 
     # Draw solid segments (active/locked) - normal color
+    line_shader.uniform_float("color", color)
     for segment in solid_segments:
         if len(segment) >= 2:
             batch = batch_for_shader(line_shader, 'LINE_STRIP', {"pos": segment})
-            line_shader.bind()
-            line_shader.uniform_float("color", color)
             batch.draw(line_shader)
 
     # Draw inactive segments (unlocked) - red color
+    line_shader.uniform_float("color", inactive_color)
     for segment in dashed_segments:
         if len(segment) >= 2:
             batch = batch_for_shader(line_shader, 'LINE_STRIP', {"pos": segment})
-            line_shader.bind()
-            line_shader.uniform_float("color", inactive_color)
             batch.draw(line_shader)
 
     # Draw points at each anchor if enabled (using shrinkwrapped positions)
     if settings.motion_path_show_points:
-        point_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        point_shader = _get_fill_shader()  # Use cached shader
+        point_shader.bind()  # Bind once
         gpu.state.point_size_set(8.0)
 
         # Locked points - full color (shrinkwrapped)
         if shrinkwrapped_locked_points:
-            batch = batch_for_shader(point_shader, 'POINTS', {"pos": shrinkwrapped_locked_points})
-            point_shader.bind()
             point_shader.uniform_float("color", color)
+            batch = batch_for_shader(point_shader, 'POINTS', {"pos": shrinkwrapped_locked_points})
             batch.draw(point_shader)
 
         # Unlocked points - red color (shrinkwrapped)
         if shrinkwrapped_unlocked_points:
-            batch = batch_for_shader(point_shader, 'POINTS', {"pos": shrinkwrapped_unlocked_points})
-            point_shader.bind()
             point_shader.uniform_float("color", inactive_color)
+            batch = batch_for_shader(point_shader, 'POINTS', {"pos": shrinkwrapped_unlocked_points})
             batch.draw(point_shader)
 
     # Reset GPU state
     gpu.state.blend_set('NONE')
     gpu.state.depth_test_set('NONE')
     gpu.state.depth_mask_set(True)
-
-
-def catmull_rom_point(p0, p1, p2, p3, t):
-    """Calculate a single point on a Catmull-Rom spline."""
-    t2 = t * t
-    t3 = t2 * t
-
-    x = 0.5 * ((2 * p1[0]) +
-               (-p0[0] + p2[0]) * t +
-               (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 +
-               (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3)
-    y = 0.5 * ((2 * p1[1]) +
-               (-p0[1] + p2[1]) * t +
-               (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
-               (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)
-    z = 0.5 * ((2 * p1[2]) +
-               (-p0[2] + p2[2]) * t +
-               (2 * p0[2] - 5 * p1[2] + 4 * p2[2] - p3[2]) * t2 +
-               (-p0[2] + 3 * p1[2] - 3 * p2[2] + p3[2]) * t3)
-
-    return (x, y, z)
+    gpu.state.point_size_set(1.0)
 
 
 def register_draw_handlers():

@@ -3,17 +3,10 @@ Settings and property definitions for world-space onion skinning.
 """
 
 import bpy
-from mathutils import Vector
 
 from .cache import clear_cache, cache_current_frame, get_active_gp
 from .drawing import register_draw_handlers, unregister_draw_handlers
-from .anchors import (
-    get_anchors,
-    get_anchor_for_frame,
-    set_anchor_for_frame,
-    calculate_anchor_from_strokes,
-    get_current_keyframes_set
-)
+from .anchors import get_current_keyframes_set
 from .handlers import set_last_keyframe_set, set_last_active_layer_name
 
 

@@ -6,7 +6,7 @@ import bpy
 import json
 from mathutils import Vector, Matrix
 
-from .transforms import get_layer_transform
+from .transforms import catmull_rom_point
 
 
 def get_anchors(gp_obj):
@@ -306,103 +306,6 @@ def get_current_keyframes_set(gp_obj, settings):
             result.add((layer.name, kf.frame_number))
     
     return result
-
-
-def is_world_locked(gp_obj, layer_name, frame):
-    """Check if a keyframe is world-locked.
-
-    Returns bool.
-    """
-    anchors = get_anchors(gp_obj)
-
-    if layer_name not in anchors:
-        return False
-
-    frame_str = str(frame)
-    if frame_str not in anchors[layer_name]:
-        return False
-
-    data = anchors[layer_name][frame_str]
-
-    if isinstance(data, dict):
-        return data.get("world_locked", False)
-
-    return False
-
-
-def get_world_locked_frames_for_layer(gp_obj, layer_name):
-    """Get list of frame numbers that are world-locked for a layer.
-
-    Returns sorted list of frame numbers.
-    """
-    anchors = get_anchors(gp_obj)
-
-    if layer_name not in anchors:
-        return []
-
-    locked_frames = []
-    for frame_str, data in anchors[layer_name].items():
-        if isinstance(data, dict) and data.get("world_locked", False):
-            locked_frames.append(int(frame_str))
-
-    return sorted(locked_frames)
-
-
-def get_lock_matrix(gp_obj, layer_name, frame):
-    """Get the lock matrix for a world-locked keyframe.
-
-    Returns Matrix or None.
-    """
-    anchors = get_anchors(gp_obj)
-
-    if layer_name not in anchors:
-        return None
-
-    frame_str = str(frame)
-    if frame_str not in anchors[layer_name]:
-        return None
-
-    data = anchors[layer_name][frame_str]
-
-    if isinstance(data, dict) and "lock_matrix" in data:
-        # Convert nested list back to Matrix
-        return Matrix(data["lock_matrix"])
-
-    return None
-
-
-def set_world_lock(gp_obj, layer_name, frame, locked, lock_matrix=None):
-    """Set the world lock state for a keyframe.
-
-    locked: bool - whether the keyframe is world-locked
-    lock_matrix: Matrix - the object's world matrix at lock time
-    """
-    anchors = get_anchors(gp_obj)
-
-    if layer_name not in anchors:
-        anchors[layer_name] = {}
-
-    frame_str = str(frame)
-
-    # Get or create anchor data
-    if frame_str in anchors[layer_name]:
-        anchor_data = anchors[layer_name][frame_str]
-        if not isinstance(anchor_data, dict):
-            anchor_data = {"pos": anchor_data} if isinstance(anchor_data, list) else {}
-    else:
-        anchor_data = {}
-
-    anchor_data["world_locked"] = locked
-
-    if lock_matrix is not None:
-        # Convert Matrix to nested list for JSON serialization
-        anchor_data["lock_matrix"] = [list(row) for row in lock_matrix]
-    elif not locked and "lock_matrix" in anchor_data:
-        # Remove lock_matrix when unlocking
-        del anchor_data["lock_matrix"]
-
-    anchors[layer_name][frame_str] = anchor_data
-    set_anchors(gp_obj, anchors)
 
 
 def get_visible_keyframe(layer, current_frame):
@@ -813,37 +716,6 @@ def get_keyframe_interpolation_type(gp_obj, frame_number):
                     return 'CONSTANT'
 
     return 'CONSTANT'
-
-
-def catmull_rom_point(p0, p1, p2, p3, t):
-    """Calculate a point on a Catmull-Rom spline.
-
-    Args:
-        p0, p1, p2, p3: Four control points (Vector or tuple)
-        t: Parameter 0-1, interpolates between p1 and p2
-
-    Returns:
-        Vector - interpolated point
-    """
-    t2 = t * t
-    t3 = t2 * t
-
-    x = 0.5 * ((2 * p1[0]) +
-              (-p0[0] + p2[0]) * t +
-              (2*p0[0] - 5*p1[0] + 4*p2[0] - p3[0]) * t2 +
-              (-p0[0] + 3*p1[0] - 3*p2[0] + p3[0]) * t3)
-
-    y = 0.5 * ((2 * p1[1]) +
-              (-p0[1] + p2[1]) * t +
-              (2*p0[1] - 5*p1[1] + 4*p2[1] - p3[1]) * t2 +
-              (-p0[1] + 3*p1[1] - 3*p2[1] + p3[1]) * t3)
-
-    z = 0.5 * ((2 * p1[2]) +
-              (-p0[2] + p2[2]) * t +
-              (2*p0[2] - 5*p1[2] + 4*p2[2] - p3[2]) * t2 +
-              (-p0[2] + 3*p1[2] - 3*p2[2] + p3[2]) * t3)
-
-    return Vector((x, y, z))
 
 
 def get_interpolated_position(gp_obj, frame):
