@@ -25,7 +25,7 @@ from .anchors import (
     get_object_lock_data,
     set_object_lock_data,
 )
-from .transforms import get_layer_transform, get_camera_direction
+from .transforms import get_layer_transform, get_camera_direction, align_canvas_to_cursor
 from .handlers import apply_object_world_lock_for_frame, reset_object_world_lock, apply_world_lock_from_stored
 from .drawing import invalidate_motion_path
 
@@ -188,7 +188,7 @@ class WONION_OT_set_anchor(bpy.types.Operator):
 
         # Lock the frame (or update if already locked)
         if is_object_locked_at_frame(gp_obj, active_kf.frame_number):
-            update_lock_anchor(gp_obj, active_kf.frame_number, cursor_pos, anchor_local_offset)
+            update_lock_anchor(gp_obj, active_kf.frame_number, cursor_pos, anchor_local_offset, matrix_local)
         else:
             # Lock the frame at this position
             original_mpi = gp_obj.matrix_parent_inverse.copy()
@@ -313,7 +313,7 @@ class WONION_OT_auto_anchor(bpy.types.Operator):
 
         # Lock the frame (or update if already locked)
         if is_object_locked_at_frame(gp_obj, active_kf.frame_number):
-            update_lock_anchor(gp_obj, active_kf.frame_number, anchor_pos, anchor_local_offset)
+            update_lock_anchor(gp_obj, active_kf.frame_number, anchor_pos, anchor_local_offset, matrix_local)
         else:
             set_lock_for_frame(gp_obj, active_kf.frame_number, anchor_pos, anchor_local_offset, original_mpi, matrix_local)
 
@@ -648,7 +648,7 @@ class WONION_OT_snap_to_cursor(bpy.types.Operator):
 
         # Lock the frame (or update if already locked)
         if is_object_locked_at_frame(gp_obj, active_kf.frame_number):
-            update_lock_anchor(gp_obj, active_kf.frame_number, cursor_pos, anchor_local_offset)
+            update_lock_anchor(gp_obj, active_kf.frame_number, cursor_pos, anchor_local_offset, matrix_local)
         else:
             # Get original MPI from existing locks (for unlock restore)
             from .anchors import get_object_lock_data
@@ -749,9 +749,30 @@ class WONION_OT_toggle_world_lock(bpy.types.Operator):
         currently_locked = is_object_locked_at_frame(gp_obj, visible_frame)
 
         if currently_locked:
-            # Unlock - reset to identity MPI (clean camera-parented state)
-            remove_lock_for_frame(gp_obj, visible_frame)
-            reset_object_world_lock(gp_obj, None)  # Identity MPI
+            # Unlock - return to vanilla camera-parented behavior
+            # Keep anchor_world data for potential re-locking
+
+            all_lock_data = get_object_lock_data(gp_obj)
+            frame_str = str(visible_frame)
+            frame_data = all_lock_data.get(frame_str, {})
+
+            # Get original_parent_inverse to restore vanilla behavior
+            if isinstance(frame_data, dict) and "original_parent_inverse" in frame_data:
+                original_mpi = Matrix(frame_data["original_parent_inverse"])
+            else:
+                original_mpi = Matrix.Identity(4)
+
+            # Mark as unlocked but keep anchor_world for re-locking
+            if isinstance(frame_data, dict):
+                frame_data["world_locked"] = False
+                all_lock_data[frame_str] = frame_data
+                set_object_lock_data(gp_obj, all_lock_data)
+            else:
+                remove_lock_for_frame(gp_obj, visible_frame)
+
+            # Restore original MPI - vanilla camera-parented behavior
+            gp_obj.matrix_parent_inverse = original_mpi
+
             self.report({'INFO'}, f"World lock OFF for frame {visible_frame}")
         else:
             # Lock - check if we have existing lock data to restore (even if currently unlocked)
@@ -771,6 +792,15 @@ class WONION_OT_toggle_world_lock(bpy.types.Operator):
                     existing_data["anchor_local_offset"],
                     existing_data["matrix_local"]
                 )
+
+                # Restore cursor position and canvas alignment
+                anchor_world = existing_data["anchor_world"]
+                scene.cursor.location = Vector(anchor_world)
+                try:
+                    align_canvas_to_cursor(context)
+                except (RuntimeError, AttributeError):
+                    pass
+
                 self.report({'INFO'}, f"World lock RESTORED for frame {visible_frame}")
             else:
                 # New lock - calculate anchor data for pivot-based billboard effect
@@ -839,6 +869,8 @@ class WONION_OT_toggle_world_lock(bpy.types.Operator):
 
                 self.report({'INFO'}, f"World lock ON for frame {visible_frame}")
 
+        # Invalidate motion path cache so dashed/solid segments update
+        invalidate_motion_path()
         self._redraw_viewports(context)
         return {'FINISHED'}
 
@@ -918,17 +950,60 @@ class WONION_OT_toggle_world_lock(bpy.types.Operator):
 
             # Apply lock for current frame
             apply_object_world_lock_for_frame(gp_obj, scene)
+
+            # Restore cursor/canvas for the visible frame
+            visible_frame = None
+            for layer in gp_obj.data.layers:
+                for kf in layer.frames:
+                    if kf.frame_number <= original_frame:
+                        if visible_frame is None or kf.frame_number > visible_frame:
+                            visible_frame = kf.frame_number
+            if visible_frame is not None:
+                all_lock_data = get_object_lock_data(gp_obj)
+                frame_str = str(visible_frame)
+                frame_data = all_lock_data.get(frame_str, {})
+                if isinstance(frame_data, dict) and "anchor_world" in frame_data and frame_data.get("world_locked", False):
+                    scene.cursor.location = Vector(frame_data["anchor_world"])
+                    try:
+                        align_canvas_to_cursor(context)
+                    except (RuntimeError, AttributeError):
+                        pass
+
             self.report({'INFO'}, f"World lock ON for {lock_count} frames")
         else:
-            # Unlock all selected frames
+            # Unlock all selected frames - return to vanilla camera-parented behavior
+            # Keep anchor_world data for potential re-locking
+            all_lock_data = get_object_lock_data(gp_obj)
+
+            # Get original_parent_inverse (same for all frames)
+            original_mpi = Matrix.Identity(4)
+            for frame_str, data in all_lock_data.items():
+                if isinstance(data, dict) and "original_parent_inverse" in data:
+                    original_mpi = Matrix(data["original_parent_inverse"])
+                    break
+
             for frame_num in selected_frames:
-                remove_lock_for_frame(gp_obj, frame_num)
+                frame_str = str(frame_num)
+                frame_data = all_lock_data.get(frame_str, {})
+
+                if not isinstance(frame_data, dict):
+                    continue
+
+                # Mark as unlocked but keep anchor_world for re-locking
+                frame_data["world_locked"] = False
+                all_lock_data[frame_str] = frame_data
                 unlock_count += 1
 
-            # Reset to identity MPI (clean camera-parented state)
-            reset_object_world_lock(gp_obj, None)
+            # Save all changes in one go
+            set_object_lock_data(gp_obj, all_lock_data)
+
+            # Restore original MPI - vanilla camera-parented behavior
+            gp_obj.matrix_parent_inverse = original_mpi
+
             self.report({'INFO'}, f"World lock OFF for {unlock_count} frames")
 
+        # Invalidate motion path cache so dashed/solid segments update
+        invalidate_motion_path()
         self._redraw_viewports(context)
         return {'FINISHED'}
 

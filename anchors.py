@@ -635,7 +635,7 @@ def set_lock_for_frame(gp_obj, frame, anchor_world, anchor_local_offset,
     set_object_lock_data(gp_obj, lock_data)
 
 
-def update_lock_anchor(gp_obj, frame, anchor_world, anchor_local_offset=None):
+def update_lock_anchor(gp_obj, frame, anchor_world, anchor_local_offset=None, matrix_local=None):
     """Update anchor position for an existing locked frame.
 
     Use this when changing anchor position without re-locking.
@@ -655,6 +655,9 @@ def update_lock_anchor(gp_obj, frame, anchor_world, anchor_local_offset=None):
 
     if anchor_local_offset is not None:
         data["anchor_local_offset"] = [anchor_local_offset[0], anchor_local_offset[1], anchor_local_offset[2]]
+
+    if matrix_local is not None:
+        data["matrix_local"] = [list(row) for row in matrix_local]
 
     lock_data[frame_str] = data
     set_object_lock_data(gp_obj, lock_data)
@@ -715,32 +718,44 @@ def find_visible_locked_frame(gp_obj, current_frame):
     return None
 
 
-def get_all_locked_frames(gp_obj, include_data=False):
+def get_all_locked_frames(gp_obj, include_data=False, include_unlocked_anchors=False):
     """Get all world-locked frames.
 
     Args:
         gp_obj: Grease Pencil object
         include_data: If True, return dict {frame_str: lock_data}
                       If False, return sorted list of frame numbers (default)
+        include_unlocked_anchors: If True, also include unlocked frames that have
+                                  anchor_world data (useful for interpolation targets)
 
     Returns:
         If include_data=False: Sorted list of frame numbers
-        If include_data=True: Dict of {frame_str: lock_data} for locked frames
+        If include_data=True: Dict of {frame_str: lock_data} for matching frames
     """
     lock_data = get_object_lock_data(gp_obj)
+
+    def frame_matches(data):
+        if not isinstance(data, dict):
+            return False
+        if data.get("world_locked", False):
+            return True
+        # Include unlocked frames with anchor_world if requested
+        if include_unlocked_anchors and "anchor_world" in data:
+            return True
+        return False
 
     if include_data:
         return {
             frame_str: data
             for frame_str, data in lock_data.items()
-            if isinstance(data, dict) and data.get("world_locked", False)
+            if frame_matches(data)
         }
     else:
-        locked_frames = []
+        matching_frames = []
         for frame_str, data in lock_data.items():
-            if isinstance(data, dict) and data.get("world_locked", False):
-                locked_frames.append(int(frame_str))
-        return sorted(locked_frames)
+            if frame_matches(data):
+                matching_frames.append(int(frame_str))
+        return sorted(matching_frames)
 
 
 def get_keyframe_interpolation_type(gp_obj, frame_number):
@@ -813,10 +828,13 @@ def catmull_rom_point(p0, p1, p2, p3, t):
 
 
 def get_interpolated_position(gp_obj, frame):
-    """Get world position for GP at given frame, with interpolation between locked frames.
+    """Get world position for GP at given frame, with interpolation between anchor frames.
 
     Reads interpolation type from GP keyframe's keyframe_type property (set via T key in timeline).
     Uses Catmull-Rom spline if motion_path_smoothing > 0 for smooth curves through all points.
+
+    NOTE: Includes UNLOCKED frames with anchor_world as interpolation targets.
+    This allows proper path interpolation from locked frames toward unlocked frames.
 
     Returns:
         (position, interpolation_data) where:
@@ -826,7 +844,8 @@ def get_interpolated_position(gp_obj, frame):
 
     If exactly on a locked frame or using CONSTANT interpolation, returns (position, None).
     """
-    locked = get_all_locked_frames(gp_obj, include_data=True)
+    # Include unlocked frames with anchors as interpolation targets
+    locked = get_all_locked_frames(gp_obj, include_data=True, include_unlocked_anchors=True)
     if not locked:
         return None, None
 

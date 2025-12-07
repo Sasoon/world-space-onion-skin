@@ -184,6 +184,9 @@ def apply_object_world_lock_for_frame(gp_obj, scene):
     Uses pivot-based billboard rotation around the anchor point.
     Supports interpolation between locked frames when enabled.
 
+    CRITICAL: The VISIBLE KEYFRAME determines behavior, not just any locked frame.
+    If the visible keyframe is unlocked (has unlocked_mpi), that takes priority.
+
     Args:
         gp_obj: The GP object to process
         scene: The current scene
@@ -194,69 +197,65 @@ def apply_object_world_lock_for_frame(gp_obj, scene):
     current_frame = scene.frame_current
     settings = scene.world_onion
 
-    # Find which locked frame is visible
-    locked_frame = find_visible_locked_frame(gp_obj, current_frame)
+    # Step 1: Find the visible GP KEYFRAME (most recent keyframe at or before current)
+    visible_keyframe = None
+    for layer in gp_obj.data.layers:
+        for kf in layer.frames:
+            if kf.frame_number <= current_frame:
+                if visible_keyframe is None or kf.frame_number > visible_keyframe:
+                    visible_keyframe = kf.frame_number
 
-    if locked_frame is not None:
-        # Get lock data for this frame
-        lock_data = get_lock_for_frame(gp_obj, locked_frame)
-        if lock_data and "anchor_world" in lock_data and "anchor_local_offset" in lock_data and "matrix_local" in lock_data:
-            # Check if interpolation is enabled
-            anchor_world = lock_data["anchor_world"]
-            anchor_local_offset = lock_data["anchor_local_offset"]
-            matrix_local = lock_data["matrix_local"]
+    if visible_keyframe is None:
+        reset_object_world_lock(gp_obj, None)
+        return
 
-            if settings.interpolation_enabled:
-                # Try to get interpolated position
-                interp_pos, interp_info = get_interpolated_position(gp_obj, current_frame)
-                if interp_pos is not None and interp_info is not None:
-                    # Use interpolated position and data from the interpolation's prev frame
-                    anchor_world = [interp_pos.x, interp_pos.y, interp_pos.z]
-                    prev_data = interp_info['prev_data']
-                    anchor_local_offset = prev_data["anchor_local_offset"]
-                    matrix_local = prev_data["matrix_local"]
+    # Step 2: Get lock data for the visible keyframe
+    all_lock_data = get_object_lock_data(gp_obj)
+    frame_str = str(visible_keyframe)
+    frame_data = all_lock_data.get(frame_str, {})
 
-            # Apply shrinkwrap adjustment if enabled
-            if settings.depth_interaction_enabled:
-                adjusted = adjust_anchor_for_depth(anchor_world, scene)
-                anchor_world = [adjusted.x, adjusted.y, adjusted.z]
+    # Step 3: FIRST check if visible keyframe is UNLOCKED (has lock data but world_locked=False)
+    # Unlocked = vanilla camera-parented behavior, no special handling
+    if isinstance(frame_data, dict) and not frame_data.get("world_locked", False) and "anchor_world" in frame_data:
+        # Frame is unlocked - restore original MPI for vanilla behavior
+        if "original_parent_inverse" in frame_data:
+            reset_object_world_lock(gp_obj, frame_data["original_parent_inverse"])
+        else:
+            reset_object_world_lock(gp_obj, None)  # Identity
+        return
 
-            # Apply world lock with pivot-based billboard effect
-            apply_world_lock_from_stored(
-                gp_obj,
-                anchor_world,
-                anchor_local_offset,
-                matrix_local
-            )
-            return
+    # Step 4: Check if visible keyframe is LOCKED
+    if isinstance(frame_data, dict) and frame_data.get("world_locked", False):
+        # Visible keyframe is locked - apply lock with interpolation
+        anchor_world = frame_data["anchor_world"]
+        anchor_local_offset = frame_data["anchor_local_offset"]
+        matrix_local = frame_data["matrix_local"]
 
-    # No locked keyframe visible at current frame
-    # BUT if interpolation is enabled, we may still be between locked frames
-    # (e.g., new unlocked keyframe created via auto-keying at interpolated position)
-    if settings.interpolation_enabled:
-        interp_pos, interp_info = get_interpolated_position(gp_obj, current_frame)
-        if interp_pos is not None and interp_info is not None:
-            # We're between locked frames - apply interpolated position
-            # This preserves the visual position when a new unlocked keyframe is created
-            prev_data = interp_info['prev_data']
-            anchor_world = [interp_pos.x, interp_pos.y, interp_pos.z]
-            anchor_local_offset = prev_data["anchor_local_offset"]
-            matrix_local = prev_data["matrix_local"]
+        if settings.interpolation_enabled:
+            # Try to get interpolated position
+            interp_pos, interp_info = get_interpolated_position(gp_obj, current_frame)
+            if interp_pos is not None and interp_info is not None:
+                # Use interpolated position and data from the interpolation's prev frame
+                anchor_world = [interp_pos.x, interp_pos.y, interp_pos.z]
+                prev_data = interp_info['prev_data']
+                anchor_local_offset = prev_data["anchor_local_offset"]
+                matrix_local = prev_data["matrix_local"]
 
-            # Apply shrinkwrap adjustment if enabled
-            if settings.depth_interaction_enabled:
-                adjusted = adjust_anchor_for_depth(anchor_world, scene)
-                anchor_world = [adjusted.x, adjusted.y, adjusted.z]
+        # Apply shrinkwrap adjustment if enabled
+        if settings.depth_interaction_enabled:
+            adjusted = adjust_anchor_for_depth(anchor_world, scene)
+            anchor_world = [adjusted.x, adjusted.y, adjusted.z]
 
-            apply_world_lock_from_stored(
-                gp_obj,
-                anchor_world,
-                anchor_local_offset,
-                matrix_local
-            )
-            return  # Don't reset MPI - preserve interpolated position
+        # Apply world lock with pivot-based billboard effect
+        apply_world_lock_from_stored(
+            gp_obj,
+            anchor_world,
+            anchor_local_offset,
+            matrix_local
+        )
+        return
 
-    # Truly no lock context - reset to identity MPI (clean camera-parented state)
+    # Step 5: Visible keyframe has no lock data - reset to identity
     reset_object_world_lock(gp_obj, None)
 
 
@@ -289,19 +288,39 @@ def on_frame_change(scene):
 
     # Track if we handled cursor via interpolation (to skip normal anchor cursor)
     cursor_handled_by_interpolation = False
+    # Track if visible keyframe is unlocked (cursor should stay at native position)
+    visible_kf_is_unlocked = False
+
+    # Check if the visible keyframe is unlocked (has lock data but world_locked=False)
+    if gp_obj is not None:
+        visible_keyframe = None
+        for layer in gp_obj.data.layers:
+            for kf in layer.frames:
+                if kf.frame_number <= scene.frame_current:
+                    if visible_keyframe is None or kf.frame_number > visible_keyframe:
+                        visible_keyframe = kf.frame_number
+        if visible_keyframe is not None:
+            all_lock_data = get_object_lock_data(gp_obj)
+            frame_str = str(visible_keyframe)
+            frame_data = all_lock_data.get(frame_str, {})
+            # Unlocked = has anchor_world (was locked before) but world_locked is False
+            if isinstance(frame_data, dict) and not frame_data.get("world_locked", False) and "anchor_world" in frame_data:
+                visible_kf_is_unlocked = True
 
     # === CURSOR/CANVAS INTERPOLATION (active GP only) ===
     # Move cursor to interpolated position when scrubbing between locked frames
+    # SKIP if visible keyframe is unlocked - cursor stays at native camera-parented position
     if gp_obj is not None and settings.interpolation_enabled and settings.anchor_enabled and settings.anchor_auto_cursor:
-        interp_pos, interp_info = get_interpolated_position(gp_obj, scene.frame_current)
-        if interp_pos is not None and interp_info is not None:
-            # We're interpolating between frames - move cursor to interpolated position
-            scene.cursor.location = interp_pos.copy()
-            cursor_handled_by_interpolation = True
-            try:
-                align_canvas_to_cursor(bpy.context)
-            except (RuntimeError, AttributeError):
-                pass
+        if not visible_kf_is_unlocked:
+            interp_pos, interp_info = get_interpolated_position(gp_obj, scene.frame_current)
+            if interp_pos is not None and interp_info is not None:
+                # We're interpolating between frames - move cursor to interpolated position
+                scene.cursor.location = interp_pos.copy()
+                cursor_handled_by_interpolation = True
+                try:
+                    align_canvas_to_cursor(bpy.context)
+                except (RuntimeError, AttributeError):
+                    pass
 
     if gp_obj is None:
         return
@@ -310,10 +329,11 @@ def on_frame_change(scene):
     if settings.anchor_enabled:
         # Update keyframe tracking set on frame change
         _last_keyframe_set = get_current_keyframes_set(gp_obj, settings)
-        
+
         # Auto-move cursor to anchor position (active layer only)
         # Skip if cursor was already set by interpolation
-        if settings.anchor_auto_cursor and not cursor_handled_by_interpolation:
+        # Skip if visible keyframe is unlocked - cursor stays at native camera-parented position
+        if settings.anchor_auto_cursor and not cursor_handled_by_interpolation and not visible_kf_is_unlocked:
             active_layer = gp_obj.data.layers.active
             if active_layer is not None:
                 current_frame = scene.frame_current
