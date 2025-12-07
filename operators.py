@@ -196,6 +196,7 @@ class WONION_OT_set_anchor(bpy.types.Operator):
 
         # Apply world lock with new anchor
         apply_object_world_lock_for_frame(gp_obj, scene)
+        context.view_layer.update()
 
         # Invalidate motion path so it updates
         invalidate_motion_path()
@@ -319,6 +320,7 @@ class WONION_OT_auto_anchor(bpy.types.Operator):
 
         # Apply the lock - positions strokes at anchor_pos
         apply_object_world_lock_for_frame(gp_obj, scene)
+        context.view_layer.update()
 
         # Move cursor to anchor
         scene.cursor.location = anchor_pos
@@ -665,6 +667,10 @@ class WONION_OT_snap_to_cursor(bpy.types.Operator):
         # Apply world lock with new anchor
         apply_object_world_lock_for_frame(gp_obj, scene)
 
+        # Force depsgraph update to ensure matrix_world is recalculated
+        # This prevents issues with stale transforms on subsequent operations
+        context.view_layer.update()
+
         # Invalidate motion path so it updates
         invalidate_motion_path()
 
@@ -950,6 +956,7 @@ class WONION_OT_toggle_world_lock(bpy.types.Operator):
 
             # Apply lock for current frame
             apply_object_world_lock_for_frame(gp_obj, scene)
+            context.view_layer.update()
 
             # Restore cursor/canvas for the visible frame
             visible_frame = None

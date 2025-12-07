@@ -232,6 +232,9 @@ def apply_object_world_lock_for_frame(gp_obj, scene):
         anchor_local_offset = frame_data["anchor_local_offset"]
         matrix_local = frame_data["matrix_local"]
 
+        # Track if we're interpolating (vs on exact keyframe)
+        is_interpolating = False
+
         if settings.interpolation_enabled:
             # Try to get interpolated position
             interp_pos, interp_info = get_interpolated_position(gp_obj, current_frame)
@@ -241,9 +244,12 @@ def apply_object_world_lock_for_frame(gp_obj, scene):
                 prev_data = interp_info['prev_data']
                 anchor_local_offset = prev_data["anchor_local_offset"]
                 matrix_local = prev_data["matrix_local"]
+                is_interpolating = True
 
-        # Apply shrinkwrap adjustment if enabled
-        if settings.depth_interaction_enabled:
+        # Apply shrinkwrap ONLY when interpolating (not on exact keyframes)
+        # On keyframes, user explicitly set the position - respect it exactly
+        # This prevents floating-point drift from double-shrinkwrapping
+        if settings.depth_interaction_enabled and is_interpolating:
             adjusted = adjust_anchor_for_depth(anchor_world, scene)
             anchor_world = [adjusted.x, adjusted.y, adjusted.z]
 
@@ -316,7 +322,11 @@ def on_frame_change(scene):
             interp_pos, interp_info = get_interpolated_position(gp_obj, scene.frame_current)
             if interp_pos is not None and interp_info is not None:
                 # We're interpolating between frames - move cursor to interpolated position
-                scene.cursor.location = interp_pos.copy()
+                cursor_pos = interp_pos.copy()
+                # Apply shrinkwrap to cursor position (match stroke positioning)
+                if settings.depth_interaction_enabled:
+                    cursor_pos = adjust_anchor_for_depth(cursor_pos, scene)
+                scene.cursor.location = cursor_pos
                 cursor_handled_by_interpolation = True
                 try:
                     align_canvas_to_cursor(bpy.context)
@@ -359,7 +369,11 @@ def on_frame_change(scene):
 
                     # Move cursor to anchor
                     if anchor_pos is not None:
-                        scene.cursor.location = anchor_pos
+                        cursor_pos = Vector(anchor_pos) if not isinstance(anchor_pos, Vector) else anchor_pos.copy()
+                        # Apply shrinkwrap to cursor position (match stroke positioning)
+                        if settings.depth_interaction_enabled:
+                            cursor_pos = adjust_anchor_for_depth(cursor_pos, scene)
+                        scene.cursor.location = cursor_pos
 
                         # Align canvas to cursor when anchor system is active
                         if settings.anchor_enabled:
