@@ -23,6 +23,7 @@ from .anchors import (
     find_visible_locked_frame,
     migrate_object_lock_frame,
     get_interpolated_position,
+    delete_lock_for_frame,
 )
 from .transforms import align_canvas_to_cursor, get_camera_direction
 from .drawing import invalidate_motion_path
@@ -523,54 +524,60 @@ def _on_depsgraph_update_impl(scene, depsgraph):
                                 # Context may be invalid during certain operations
                                 pass
 
-    # Handle anchor system - detect keyframe moves and NEW keyframes
+    # Invalidate motion path on ANY GP data change (keyframe add/delete/move)
+    # This is separate from anchor system - motion path should always update
+    if gp_data_changed:
+        invalidate_motion_path()
+
+    # Detect keyframe changes - ALWAYS run for lock data cleanup (not just when anchor enabled)
+    if gp_data_changed and _last_keyframe_set:
+        current_kf_set = get_current_keyframes_set(gp_obj, settings)
+        removed_by_layer = {}
+        added_by_layer = {}
+
+        for layer_name, frame in (_last_keyframe_set - current_kf_set):
+            removed_by_layer.setdefault(layer_name, []).append(frame)
+
+        for layer_name, frame in (current_kf_set - _last_keyframe_set):
+            added_by_layer.setdefault(layer_name, []).append(frame)
+
+        # Track which frames were moved (to distinguish from deletions)
+        moved_frames = set()
+
+        # Check for moves (1 removed + 1 added on same layer = move)
+        for layer_name in removed_by_layer:
+            if layer_name in added_by_layer:
+                removed = removed_by_layer[layer_name]
+                added = added_by_layer[layer_name]
+                if len(removed) == 1 and len(added) == 1:
+                    old_frame = removed[0]
+                    new_frame = added[0]
+                    moved_frames.add(old_frame)
+                    # Migrate both anchor data and object lock data
+                    migrate_anchor_data(gp_obj, layer_name, old_frame, new_frame)
+                    migrate_object_lock_frame(gp_obj, old_frame, new_frame)
+                elif len(removed) == len(added):
+                    # Multiple keyframes moved together - migrate each pair
+                    # Sort both lists to match old->new by position
+                    removed_sorted = sorted(removed)
+                    added_sorted = sorted(added)
+                    for old_frame, new_frame in zip(removed_sorted, added_sorted):
+                        moved_frames.add(old_frame)
+                        migrate_anchor_data(gp_obj, layer_name, old_frame, new_frame)
+                        migrate_object_lock_frame(gp_obj, old_frame, new_frame)
+
+        # Delete lock data for frames that were DELETED (not moved)
+        # This keeps motion path and interpolation in sync with actual keyframes
+        for layer_name, frames in removed_by_layer.items():
+            for frame in frames:
+                if frame not in moved_frames:
+                    # This keyframe was deleted, not moved - remove its lock data
+                    delete_lock_for_frame(gp_obj, frame)
+
+    # Handle anchor system features (cursor auto-move, new keyframe capture, etc.)
     if gp_data_changed and settings.anchor_enabled:
         current_frame = scene.frame_current
         current_kf_set = get_current_keyframes_set(gp_obj, settings)
-
-        # Detect keyframe MOVES (1 removed + 1 added on same layer)
-        if _last_keyframe_set:
-            removed_by_layer = {}
-            added_by_layer = {}
-
-            for layer_name, frame in (_last_keyframe_set - current_kf_set):
-                removed_by_layer.setdefault(layer_name, []).append(frame)
-
-            for layer_name, frame in (current_kf_set - _last_keyframe_set):
-                added_by_layer.setdefault(layer_name, []).append(frame)
-
-            # Invalidate motion path if any keyframes changed
-            if removed_by_layer or added_by_layer:
-                invalidate_motion_path()
-
-            # Track which frames were moved (to distinguish from deletions)
-            moved_frames = set()
-
-            # Check for moves (1 removed + 1 added on same layer = move)
-            for layer_name in removed_by_layer:
-                if layer_name in added_by_layer:
-                    removed = removed_by_layer[layer_name]
-                    added = added_by_layer[layer_name]
-                    if len(removed) == 1 and len(added) == 1:
-                        old_frame = removed[0]
-                        new_frame = added[0]
-                        moved_frames.add(old_frame)
-                        # Migrate both anchor data and object lock data
-                        migrate_anchor_data(gp_obj, layer_name, old_frame, new_frame)
-                        migrate_object_lock_frame(gp_obj, old_frame, new_frame)
-                    elif len(removed) == len(added):
-                        # Multiple keyframes moved together - migrate each pair
-                        # Sort both lists to match old->new by position
-                        removed_sorted = sorted(removed)
-                        added_sorted = sorted(added)
-                        for old_frame, new_frame in zip(removed_sorted, added_sorted):
-                            moved_frames.add(old_frame)
-                            migrate_anchor_data(gp_obj, layer_name, old_frame, new_frame)
-                            migrate_object_lock_frame(gp_obj, old_frame, new_frame)
-
-            # Note: We intentionally don't auto-delete lock data for removed keyframes.
-            # Orphaned lock data is harmless, and auto-deletion caused issues with
-            # multi-keyframe moves. Users can use "Clear All Locks" to clean up.
 
         # Update user-facing anchor from strokes if snap_to_stroke enabled
         active_layer = gp_obj.data.layers.active

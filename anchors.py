@@ -665,7 +665,10 @@ def update_lock_anchor(gp_obj, frame, anchor_world, anchor_local_offset=None, ma
 
 
 def remove_lock_for_frame(gp_obj, frame):
-    """Remove world lock for a specific frame (unlock)."""
+    """Remove world lock for a specific frame (unlock).
+
+    Keeps anchor_world data for potential re-locking.
+    """
     lock_data = get_object_lock_data(gp_obj)
     frame_str = str(frame)
 
@@ -676,6 +679,22 @@ def remove_lock_for_frame(gp_obj, frame):
         else:
             del lock_data[frame_str]
         set_object_lock_data(gp_obj, lock_data)
+
+
+def delete_lock_for_frame(gp_obj, frame):
+    """Fully delete lock data for a frame (when keyframe is deleted).
+
+    Unlike remove_lock_for_frame which keeps data for re-locking,
+    this completely removes the lock data entry.
+    """
+    lock_data = get_object_lock_data(gp_obj)
+    frame_str = str(frame)
+
+    if frame_str in lock_data:
+        del lock_data[frame_str]
+        set_object_lock_data(gp_obj, lock_data)
+        return True
+    return False
 
 
 def find_visible_locked_frame(gp_obj, current_frame):

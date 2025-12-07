@@ -511,6 +511,11 @@ def draw_motion_path_callback():
 
     # Apply smoothing if enabled
     smoothing = settings.motion_path_smoothing
+
+    # Collect shrinkwrapped anchor positions for point drawing
+    shrinkwrapped_locked_points = []
+    shrinkwrapped_unlocked_points = []
+
     if smoothing > 0:
         # For smoothing, we need to track which segment each smoothed point belongs to
         # Build segments with their lock status, then smooth each segment
@@ -519,7 +524,7 @@ def draw_motion_path_callback():
 
         for i in range(len(path_data) - 1):
             start_pos, start_locked = path_data[i]
-            end_pos, _ = path_data[i + 1]
+            end_pos, end_locked = path_data[i + 1]
 
             # Generate smoothed points for this segment
             if len(path_points) >= 2:
@@ -542,10 +547,20 @@ def draw_motion_path_callback():
             if settings.depth_interaction_enabled:
                 segment_points = adjust_path_points_to_mesh(segment_points, scene)
 
+            # Collect shrinkwrapped anchor positions
             if start_locked:
+                shrinkwrapped_locked_points.append(segment_points[0])
                 solid_segments.append(segment_points)
             else:
+                shrinkwrapped_unlocked_points.append(segment_points[0])
                 dashed_segments.append(segment_points)
+
+            # Last anchor point (from final segment's end)
+            if i == len(path_data) - 2:
+                if end_locked:
+                    shrinkwrapped_locked_points.append(segment_points[-1])
+                else:
+                    shrinkwrapped_unlocked_points.append(segment_points[-1])
     else:
         # No smoothing - just separate into segments by lock status
         solid_segments = []
@@ -553,17 +568,27 @@ def draw_motion_path_callback():
 
         for i in range(len(path_data) - 1):
             start_pos, start_locked = path_data[i]
-            end_pos, _ = path_data[i + 1]
+            end_pos, end_locked = path_data[i + 1]
             segment_points = [start_pos, end_pos]
 
             # Apply depth interaction if enabled
             if settings.depth_interaction_enabled:
                 segment_points = adjust_path_points_to_mesh(segment_points, scene)
 
+            # Collect shrinkwrapped anchor positions
             if start_locked:
+                shrinkwrapped_locked_points.append(segment_points[0])
                 solid_segments.append(segment_points)
             else:
+                shrinkwrapped_unlocked_points.append(segment_points[0])
                 dashed_segments.append(segment_points)
+
+            # Last anchor point (from final segment's end)
+            if i == len(path_data) - 2:
+                if end_locked:
+                    shrinkwrapped_locked_points.append(segment_points[-1])
+                else:
+                    shrinkwrapped_unlocked_points.append(segment_points[-1])
 
     # Set up GPU state
     gpu.state.blend_set('ALPHA')
@@ -595,23 +620,21 @@ def draw_motion_path_callback():
             line_shader.uniform_float("color", inactive_color)
             batch.draw(line_shader)
 
-    # Draw points at each anchor if enabled
+    # Draw points at each anchor if enabled (using shrinkwrapped positions)
     if settings.motion_path_show_points:
         point_shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.point_size_set(8.0)
 
-        # Locked points - full color
-        locked_points = [p[0] for p in path_data if p[1]]
-        if locked_points:
-            batch = batch_for_shader(point_shader, 'POINTS', {"pos": locked_points})
+        # Locked points - full color (shrinkwrapped)
+        if shrinkwrapped_locked_points:
+            batch = batch_for_shader(point_shader, 'POINTS', {"pos": shrinkwrapped_locked_points})
             point_shader.bind()
             point_shader.uniform_float("color", color)
             batch.draw(point_shader)
 
-        # Unlocked points - red color
-        unlocked_points = [p[0] for p in path_data if not p[1]]
-        if unlocked_points:
-            batch = batch_for_shader(point_shader, 'POINTS', {"pos": unlocked_points})
+        # Unlocked points - red color (shrinkwrapped)
+        if shrinkwrapped_unlocked_points:
+            batch = batch_for_shader(point_shader, 'POINTS', {"pos": shrinkwrapped_unlocked_points})
             point_shader.bind()
             point_shader.uniform_float("color", inactive_color)
             batch.draw(point_shader)
