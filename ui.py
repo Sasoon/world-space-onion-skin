@@ -55,8 +55,8 @@ class WONION_PT_main_panel(bpy.types.Panel):
         if context.mode == 'EDIT_GREASE_PENCIL':
             layout.separator()
             row = layout.row(align=True)
-            row.operator("world_onion.snap_to_gp", text="Snap to GP", icon='GREASEPENCIL')
             row.operator("world_onion.snap_to_cursor", text="Snap to Cursor", icon='CURSOR')
+            row.operator("world_onion.snap_to_gp", text="Snap to GP", icon='GREASEPENCIL')
 
 
 class WONION_PT_frames(bpy.types.Panel):
@@ -121,29 +121,6 @@ class WONION_PT_appearance(bpy.types.Panel):
         row.prop(settings, "color_after", text="")
 
 
-class WONION_PT_filters(bpy.types.Panel):
-    """Filter settings sub-panel"""
-    bl_label = "Filters"
-    bl_idname = "WONION_PT_filters"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'Onion'
-    bl_parent_id = "WONION_PT_main_panel"
-    bl_options = {'DEFAULT_CLOSED'}
-
-    @classmethod
-    def poll(cls, context):
-        settings = context.scene.world_onion
-        return settings.enabled and get_active_gp(context) is not None
-
-    def draw(self, context):
-        layout = self.layout
-        settings = context.scene.world_onion
-
-        layout.prop(settings, "skip_underscore")
-        layout.prop(settings, "layer_filter")
-
-
 class WONION_PT_animation(bpy.types.Panel):
     """Animation and Anchor settings sub-panel"""
     bl_label = "Motion & Anchors"
@@ -164,10 +141,10 @@ class WONION_PT_animation(bpy.types.Panel):
         settings = context.scene.world_onion
         gp_obj = get_active_gp(context)
 
-        # Snap buttons at the top, same row
+        # Snap buttons at the top, same row (Cursor first, then GP)
         row = layout.row(align=True)
-        row.operator("world_onion.snap_to_gp", text="Snap to GP", icon='GREASEPENCIL')
         row.operator("world_onion.snap_to_cursor", text="Snap to Cursor", icon='CURSOR')
+        row.operator("world_onion.snap_to_gp", text="Snap to GP", icon='GREASEPENCIL')
 
         layout.separator()
 
@@ -195,7 +172,6 @@ class WONION_PT_animation(bpy.types.Panel):
         if settings.anchor_enabled:
             box = layout.box()
             box.prop(settings, "anchor_auto_cursor")
-            box.prop(settings, "anchor_show_indicators")
 
         layout.separator()
 
@@ -262,7 +238,6 @@ panel_classes = (
     WONION_PT_main_panel,
     WONION_PT_frames,
     WONION_PT_appearance,
-    WONION_PT_filters,
     WONION_PT_animation,
     WONION_PT_cache,
     WONION_PT_dev,

@@ -86,6 +86,12 @@ def on_frame_change(scene):
     if settings.stroke_z_offset > 0:
         gp_obj.location.z += settings.stroke_z_offset
 
+    # === FORCE DEPSGRAPH UPDATE ===
+    # After shrinkwrap/Z-offset modifies location, force matrix_world recalculation
+    # so cache captures the correct world-space positions
+    if settings.depth_interaction_enabled or settings.stroke_z_offset > 0:
+        bpy.context.view_layer.update()
+
     # === ANCHOR SYSTEM ===
     if settings.anchor_enabled:
         # Update keyframe tracking set on frame change

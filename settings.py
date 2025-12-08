@@ -38,22 +38,11 @@ def update_setting(self, context):
             area.tag_redraw()
 
 
-def update_filter(self, context):
-    """Called when filter settings change."""
-    # Filters affect what strokes are shown - need to rebuild cache
-    clear_cache()
-
-    gp_obj = get_active_gp(context)
-    if self.enabled and gp_obj is not None:
-        cache_current_frame(gp_obj, self)
-
-    for area in context.screen.areas:
-        if area.type == 'VIEW_3D':
-            area.tag_redraw()
-
-
 def update_realtime(self, context):
     """Called when realtime settings change (Z offset, shrinkwrap) - apply immediately."""
+    # Clear stale cached data so strokes are recalculated with new settings
+    clear_cache()
+
     # Force frame re-evaluation to apply the change
     scene = context.scene
     current_frame = scene.frame_current
@@ -152,20 +141,6 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         update=update_setting,
     )
     
-    skip_underscore: bpy.props.BoolProperty(
-        name="Skip _ Layers",
-        description="Skip layers whose names start with underscore",
-        default=True,
-        update=update_filter,
-    )
-    
-    layer_filter: bpy.props.StringProperty(
-        name="Layer Filter",
-        description="Only show layers containing this text (empty = all)",
-        default="",
-        update=update_filter,
-    )
-    
     # Anchor system properties
     anchor_enabled: bpy.props.BoolProperty(
         name="Enable Anchors",
@@ -180,15 +155,8 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         default=True,
         update=update_setting,
     )
-    
-    anchor_show_indicators: bpy.props.BoolProperty(
-        name="Show Indicators",
-        description="Show visual indicators at anchor positions",
-        default=True,
-        update=update_setting,
-    )
 
-    # Motion path properties (simplified/native fallback)
+    # Motion path properties
     motion_path_enabled: bpy.props.BoolProperty(
         name="Show Motion Path",
         description="Draw a line connecting anchor positions across locked frames",

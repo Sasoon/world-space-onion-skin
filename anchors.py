@@ -227,10 +227,6 @@ def get_current_keyframes_set(gp_obj, settings):
     for layer in gp_obj.data.layers:
         if layer.hide:
             continue
-        if settings.skip_underscore and layer.name.startswith('_'):
-            continue
-        if settings.layer_filter and settings.layer_filter not in layer.name:
-            continue
         
         for kf in layer.frames:
             result.add((layer.name, kf.frame_number))
@@ -265,7 +261,7 @@ def get_all_anchor_positions(gp_obj, settings):
     anchors = get_anchors(gp_obj)
 
     for layer_name, layer_anchors in anchors.items():
-        # Check if layer passes filters
+        # Check if layer exists and is visible
         layer = None
         for l in gp_obj.data.layers:
             if l.name == layer_name:
@@ -275,10 +271,6 @@ def get_all_anchor_positions(gp_obj, settings):
         if layer is None:
             continue
         if layer.hide:
-            continue
-        if settings.skip_underscore and layer.name.startswith('_'):
-            continue
-        if settings.layer_filter and settings.layer_filter not in layer.name:
             continue
 
         for frame_str, anchor_data in layer_anchors.items():

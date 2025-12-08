@@ -229,10 +229,6 @@ def get_keyframe_based_frames(gp_obj, settings, current_frame):
     for layer in gp_obj.data.layers:
         if layer.hide:
             continue
-        if settings.skip_underscore and layer.name.startswith('_'):
-            continue
-        if settings.layer_filter and settings.layer_filter not in layer.name:
-            continue
         
         for kf in layer.frames:
             all_keyframes.add(kf.frame_number)
@@ -305,9 +301,6 @@ def draw_anchor_callback():
         return
     
     if not settings.anchor_enabled:
-        return
-    
-    if not settings.anchor_show_indicators:
         return
 
     # Get active GP object (auto-detect)

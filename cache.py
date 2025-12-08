@@ -73,10 +73,6 @@ def extract_strokes_at_current_frame(gp_obj, settings):
     for layer in gp_obj.data.layers:
         if layer.hide:
             continue
-        if settings.skip_underscore and layer.name.startswith('_'):
-            continue
-        if settings.layer_filter and settings.layer_filter not in layer.name:
-            continue
         
         layer_matrix = get_layer_transform(layer)
         full_matrix = world_matrix @ layer_matrix
