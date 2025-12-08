@@ -152,19 +152,20 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
     # Transform strokes back to local space relative to new object position
     for i, stroke in enumerate(drawing.strokes):
         if move_selected_strokes_to_target and stroke.select:
-            # Calculate current centroid
+            # Calculate bottom-center anchor point (center XY, lowest Z)
+            # This ensures strokes sit ON the surface rather than clipping through
             points_world = stroke_points[i]
             if not points_world:
                 continue
                 
             sum_x = sum(p.x for p in points_world)
             sum_y = sum(p.y for p in points_world)
-            sum_z = sum(p.z for p in points_world)
+            min_z = min(p.z for p in points_world)
             n = len(points_world)
-            centroid = Vector((sum_x/n, sum_y/n, sum_z/n))
+            bottom_center = Vector((sum_x/n, sum_y/n, min_z))
             
-            # We want centroid to be at target_world_pos
-            offset = target_world_pos - centroid
+            # We want bottom_center to be at target_world_pos
+            offset = target_world_pos - bottom_center
             
             # Apply offset to world points, then transform to new local
             for j, p_world in enumerate(points_world):
@@ -218,10 +219,10 @@ class WONION_OT_set_anchor(bpy.types.Operator):
         return result
 
 
-class WONION_OT_auto_anchor(bpy.types.Operator):
-    """Auto-center anchor on strokes (moves object to stroke center)"""
-    bl_idname = "world_onion.auto_anchor"
-    bl_label = "Auto Anchor"
+class WONION_OT_snap_to_gp(bpy.types.Operator):
+    """Snap cursor and anchor to stroke bottom-center (center XY, lowest Z)"""
+    bl_idname = "world_onion.snap_to_gp"
+    bl_label = "Snap to GP"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -240,17 +241,17 @@ class WONION_OT_auto_anchor(bpy.types.Operator):
         scene = context.scene
         current_frame = scene.frame_current
         
-        # Calculate stroke center
+        # Calculate stroke bottom-center (center XY, lowest Z)
         anchor_pos = calculate_anchor_from_strokes(gp_obj, active_layer, current_frame)
         
         if anchor_pos is None:
-            # Fallback to current location if no strokes
-            anchor_pos = gp_obj.location.copy()
+            self.report({'WARNING'}, "No strokes found")
+            return {'CANCELLED'}
         
         result = set_anchor_logic(context, gp_obj, scene, anchor_pos, move_selected_strokes_to_target=False)
         
         if result == {'FINISHED'}:
-            self.report({'INFO'}, "Auto-anchored (Object moved to Stroke Center)")
+            self.report({'INFO'}, "Snapped to GP (bottom-center)")
             scene.cursor.location = anchor_pos
             cam_dir = get_camera_direction(scene)
             set_anchor_for_frame(gp_obj, active_layer.name, scene.frame_current, anchor_pos, cam_dir)
@@ -382,7 +383,7 @@ operator_classes = (
     WONION_OT_clear_cache,
     WONION_OT_build_cache,
     WONION_OT_set_anchor,
-    WONION_OT_auto_anchor,
+    WONION_OT_snap_to_gp,
     WONION_OT_snap_to_cursor,
     WONION_OT_clear_anchor,
     WONION_OT_clear_all_anchors,

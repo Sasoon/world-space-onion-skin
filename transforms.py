@@ -107,17 +107,18 @@ def align_canvas_to_cursor(context):
 def ensure_billboard_constraint(gp_obj, scene):
     """Ensure the GP object has a billboard constraint targeting the active camera.
     
-    Adds a COPY_ROTATION constraint if missing.
-    Updates target if camera changed.
+    Uses COPY_ROTATION to match camera orientation so strokes always face the viewer.
+    Returns True if constraint was added or modified.
     """
     if gp_obj is None:
-        return
+        return False
 
     camera = scene.camera
     if camera is None:
-        return
+        return False
 
     CONSTRAINT_NAME = "WorldOnion_Billboard"
+    modified = False
 
     # Find existing constraint
     constraint = gp_obj.constraints.get(CONSTRAINT_NAME)
@@ -125,16 +126,47 @@ def ensure_billboard_constraint(gp_obj, scene):
     if constraint is None:
         constraint = gp_obj.constraints.new(type='COPY_ROTATION')
         constraint.name = CONSTRAINT_NAME
+        modified = True
+    
+    # Ensure all settings are correct
+    if constraint.use_x != True:
         constraint.use_x = True
+        modified = True
+    if constraint.use_y != True:
         constraint.use_y = True
+        modified = True
+    if constraint.use_z != True:
         constraint.use_z = True
+        modified = True
+    if constraint.mix_mode != 'REPLACE':
         constraint.mix_mode = 'REPLACE'
+        modified = True
+    if constraint.target_space != 'WORLD':
         constraint.target_space = 'WORLD'
+        modified = True
+    if constraint.owner_space != 'WORLD':
         constraint.owner_space = 'WORLD'
+        modified = True
+    if constraint.influence != 1.0:
+        constraint.influence = 1.0
+        modified = True
+    if constraint.mute:
+        constraint.mute = False
+        modified = True
     
     # Ensure target is correct
     if constraint.target != camera:
         constraint.target = camera
+        modified = True
+    
+    # Force depsgraph update if we made changes
+    if modified:
+        try:
+            bpy.context.view_layer.update()
+        except (RuntimeError, AttributeError):
+            pass
+    
+    return modified
 
 
 def adjust_obj_to_surface(gp_obj, scene):

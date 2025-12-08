@@ -54,7 +54,9 @@ class WONION_PT_main_panel(bpy.types.Panel):
         # Edit mode tools
         if context.mode == 'EDIT_GREASE_PENCIL':
             layout.separator()
-            layout.operator("world_onion.snap_to_cursor", icon='CURSOR')
+            row = layout.row(align=True)
+            row.operator("world_onion.snap_to_gp", text="Snap to GP", icon='GREASEPENCIL')
+            row.operator("world_onion.snap_to_cursor", text="Snap to Cursor", icon='CURSOR')
 
 
 class WONION_PT_frames(bpy.types.Panel):
@@ -162,7 +164,14 @@ class WONION_PT_animation(bpy.types.Panel):
         settings = context.scene.world_onion
         gp_obj = get_active_gp(context)
 
-        # Motion Path (Always visible)
+        # Snap buttons at the top, same row
+        row = layout.row(align=True)
+        row.operator("world_onion.snap_to_gp", text="Snap to GP", icon='GREASEPENCIL')
+        row.operator("world_onion.snap_to_cursor", text="Snap to Cursor", icon='CURSOR')
+
+        layout.separator()
+
+        # Motion Path
         row = layout.row(align=True)
         row.prop(settings, "motion_path_enabled")
         if settings.motion_path_enabled:
@@ -171,11 +180,10 @@ class WONION_PT_animation(bpy.types.Panel):
             
             row = layout.row(align=True)
             row.prop(settings, "motion_path_show_points")
-            # row.prop(settings, "motion_path_smoothing") # Smoothing requires interpolation logic
 
         layout.separator()
 
-        # Shrinkwrap (Always visible)
+        # Shrinkwrap
         layout.prop(settings, "depth_interaction_enabled")
 
         layout.separator()
@@ -192,9 +200,9 @@ class WONION_PT_animation(bpy.types.Panel):
 
         layout.separator()
 
+        # Anchor data management
         row = layout.row(align=True)
-        row.operator("world_onion.auto_anchor", text="Auto", icon='CON_LOCLIKE')
-        row.operator("world_onion.set_anchor", text="Cursor", icon='PINNED')
+        row.operator("world_onion.set_anchor", text="Set Anchor", icon='PINNED')
         row.operator("world_onion.clear_anchor", text="Clear", icon='UNPINNED')
         row.operator("world_onion.clear_all_anchors", text="", icon='X')
 

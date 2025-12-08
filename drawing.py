@@ -518,6 +518,7 @@ def draw_motion_path_callback():
 def register_draw_handlers():
     """Register GPU draw handlers."""
     global _draw_handler, _anchor_draw_handler, _motion_path_handler
+    global _motion_path_cache, _motion_path_cache_gp, _motion_path_dirty
 
     if _draw_handler is None:
         _draw_handler = bpy.types.SpaceView3D.draw_handler_add(
@@ -533,6 +534,11 @@ def register_draw_handlers():
         _motion_path_handler = bpy.types.SpaceView3D.draw_handler_add(
             draw_motion_path_callback, (), 'WINDOW', 'POST_VIEW'
         )
+
+    # Force motion path rebuild on registration (fixes reload not showing path)
+    _motion_path_cache = None
+    _motion_path_cache_gp = None
+    _motion_path_dirty = True
 
 
 def unregister_draw_handlers():
