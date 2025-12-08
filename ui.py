@@ -162,6 +162,15 @@ class WONION_PT_animation(bpy.types.Panel):
 
         # Shrinkwrap and Z Offset
         layout.prop(settings, "depth_interaction_enabled")
+        if settings.depth_interaction_enabled:
+            row = layout.row(align=True)
+            row.operator("world_onion.bake_shrinkwrap", icon='FILE_REFRESH')
+            # Show bake status
+            from .drawing import is_bake_valid
+            if is_bake_valid():
+                row.label(text="", icon='CHECKMARK')
+            else:
+                row.label(text="", icon='ERROR')
         layout.prop(settings, "stroke_z_offset")
 
         layout.separator()

@@ -10,6 +10,7 @@ from mathutils import Vector
 from .cache import get_cache, get_active_gp
 from .anchors import get_all_anchor_positions
 from .transforms import SURFACE_OFFSET, catmull_rom_point, adjust_obj_to_surface
+from .debug_log import log, log_onion_draw, log_bake, log_cursor
 
 
 # Draw handler references
@@ -21,6 +22,13 @@ _motion_path_handler = None
 _motion_path_cache = None  # List of (x, y, z) tuples
 _motion_path_cache_gp = None  # GP object the cache is for
 _motion_path_dirty = True
+
+# Baked shrinkwrap offsets - computed ONCE when shrinkwrap enabled or animation changes
+# Structure: {frame: z_offset}  - stores the Z offset from raycast
+_baked_shrinkwrap_offsets = {}
+_baked_offset_valid = False  # True after successful bake
+
+# v8.5: Timer code removed - now using modal operator in operators.py
 
 # Cached shaders (lazy initialized to avoid GPU calls at import time)
 _stroke_shader = None
@@ -47,6 +55,229 @@ def invalidate_motion_path():
     """Mark motion path cache as dirty, triggering rebuild on next draw."""
     global _motion_path_dirty
     _motion_path_dirty = True
+
+
+def invalidate_baked_offsets():
+    """Mark baked offsets as invalid, requiring re-bake."""
+    global _baked_offset_valid
+    _baked_offset_valid = False
+
+
+def get_baked_offset(frame):
+    """
+    Get pre-baked shrinkwrap Z offset for a frame.
+    Returns offset value, or None if not baked.
+    """
+    if not _baked_offset_valid:
+        return None
+    return _baked_shrinkwrap_offsets.get(frame)
+
+
+def is_bake_valid():
+    """Check if baked offsets are valid."""
+    return _baked_offset_valid
+
+
+# ============================================================================
+# v8.1: DRIVER NAMESPACE OFFSET SYSTEM
+# Uses bpy.app.driver_namespace to register a lookup function.
+# Driver expression calls this function - NO KEYFRAMES NEEDED!
+# Clean timeline, reliable offset application.
+# ============================================================================
+
+def _get_shrinkwrap_offset_for_driver(frame):
+    """
+    Driver namespace function - called by driver expression.
+    Returns the baked offset for the given frame.
+    This is registered in bpy.app.driver_namespace["shrinkwrap_offset"].
+    """
+    if not _baked_offset_valid:
+        return 0.0
+    return _baked_shrinkwrap_offsets.get(int(frame), 0.0)
+
+
+def register_driver_namespace():
+    """Register our lookup function in the driver namespace."""
+    bpy.app.driver_namespace["shrinkwrap_offset"] = _get_shrinkwrap_offset_for_driver
+
+
+def unregister_driver_namespace():
+    """Unregister from driver namespace."""
+    if "shrinkwrap_offset" in bpy.app.driver_namespace:
+        del bpy.app.driver_namespace["shrinkwrap_offset"]
+
+
+def _setup_shrinkwrap_driver(gp_obj):
+    """
+    Add driver on delta_location.z that calls our namespace function.
+    No keyframes needed - just a Python expression!
+
+    The driver expression 'shrinkwrap_offset(frame)' calls our registered
+    function which looks up the offset from our baked dict.
+    """
+    # Remove existing driver if present (avoid duplicates)
+    try:
+        gp_obj.driver_remove("delta_location", 2)  # index 2 = Z
+    except:
+        pass  # No driver existed
+
+    # Ensure namespace function is registered
+    register_driver_namespace()
+
+    # Add new driver
+    fcurve = gp_obj.driver_add("delta_location", 2)
+    driver = fcurve.driver
+    driver.type = 'SCRIPTED'
+
+    # Add frame variable that reads current frame from scene
+    var = driver.variables.new()
+    var.name = "frame"
+    var.type = 'SINGLE_PROP'
+    var.targets[0].id_type = 'SCENE'
+    var.targets[0].id = bpy.context.scene
+    var.targets[0].data_path = "frame_current"
+
+    # Expression calls our registered namespace function
+    driver.expression = "shrinkwrap_offset(frame)"
+
+    log("Setup driver on delta_location.z using namespace function", "BAKE")
+
+
+def remove_shrinkwrap_driver(gp_obj):
+    """
+    Remove the shrinkwrap driver when feature is disabled.
+    Also resets delta_location.z to 0.
+    """
+    if gp_obj is None:
+        return
+
+    try:
+        gp_obj.driver_remove("delta_location", 2)
+        log("Removed shrinkwrap driver from delta_location.z", "BAKE")
+    except:
+        pass  # Driver didn't exist
+
+    # Reset delta_location to avoid stuck offset
+    try:
+        gp_obj.delta_location.z = 0.0
+    except:
+        pass
+
+
+def bake_shrinkwrap_offsets(gp_obj, settings, scene):
+    """
+    Pre-compute shrinkwrap Z offsets for ENTIRE animation range.
+
+    Called when shrinkwrap is enabled or animation changes.
+    MUST be called from a context where raycast is reliable (not during playback).
+
+    This eliminates runtime raycast dependency - during playback we just
+    read from this lookup table.
+    """
+    global _baked_shrinkwrap_offsets, _baked_offset_valid
+
+    _baked_shrinkwrap_offsets = {}
+    _baked_offset_valid = False
+
+    if not gp_obj:
+        return 0
+
+    if not gp_obj.animation_data or not gp_obj.animation_data.action:
+        # No animation - just compute current frame offset
+        offset = _compute_single_frame_offset(gp_obj, scene, scene.frame_current)
+        if offset is not None:
+            _baked_shrinkwrap_offsets[scene.frame_current] = offset
+            _baked_offset_valid = True
+        return 1
+
+    # Get frame range from animation
+    start_frame = int(gp_obj.animation_data.action.frame_range[0])
+    end_frame = int(gp_obj.animation_data.action.frame_range[1])
+
+    # Get location F-curves for evaluation
+    fcurves = gp_obj.animation_data.action.fcurves
+    fc_x = fcurves.find('location', index=0)
+    fc_y = fcurves.find('location', index=1)
+    fc_z = fcurves.find('location', index=2)
+
+    if not fc_x or not fc_y or not fc_z:
+        return 0
+
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    except (RuntimeError, AttributeError):
+        return 0
+
+    count = 0
+    for frame in range(start_frame, end_frame + 1):
+        # Evaluate F-curve position
+        x = fc_x.evaluate(frame)
+        y = fc_y.evaluate(frame)
+        z = fc_z.evaluate(frame)
+
+        # Raycast down to find mesh surface
+        ray_origin = Vector((x, y, z + 1000.0))
+        ray_dir = Vector((0, 0, -1))
+
+        try:
+            hit, location, normal, index, hit_obj, matrix = scene.ray_cast(
+                depsgraph, ray_origin, ray_dir
+            )
+
+            if hit and hit_obj != gp_obj:
+                # Offset = mesh_z - fcurve_z + small surface offset
+                offset = (location.z + SURFACE_OFFSET) - z
+                _baked_shrinkwrap_offsets[frame] = offset
+            else:
+                # No mesh below - zero offset
+                _baked_shrinkwrap_offsets[frame] = 0.0
+        except (RuntimeError, AttributeError):
+            _baked_shrinkwrap_offsets[frame] = 0.0
+
+        count += 1
+
+    _baked_offset_valid = True
+
+    # Also invalidate motion path so it rebuilds with baked offsets
+    invalidate_motion_path()
+
+    # DEBUG: Log bake results
+    if _baked_shrinkwrap_offsets:
+        offsets = list(_baked_shrinkwrap_offsets.values())
+        offset_range = f"min={min(offsets):.4f} max={max(offsets):.4f}"
+    else:
+        offset_range = "empty"
+    log_bake(count, offset_range)
+
+    # v8.1: Setup driver that calls our namespace function
+    # NO KEYFRAMES - just stores in dict and driver looks it up!
+    _setup_shrinkwrap_driver(gp_obj)
+
+    return count
+
+
+def _compute_single_frame_offset(gp_obj, scene, frame):
+    """Compute shrinkwrap offset for a single frame."""
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    except (RuntimeError, AttributeError):
+        return None
+
+    pos = gp_obj.location.copy()
+
+    ray_origin = Vector((pos.x, pos.y, pos.z + 1000.0))
+    ray_dir = Vector((0, 0, -1))
+
+    try:
+        hit, location, normal, index, hit_obj, matrix = scene.ray_cast(
+            depsgraph, ray_origin, ray_dir
+        )
+        if hit and hit_obj != gp_obj:
+            return (location.z + SURFACE_OFFSET) - pos.z
+    except (RuntimeError, AttributeError):
+        pass
+
+    return 0.0
 
 
 def adjust_path_points_to_mesh(points, scene):
@@ -109,6 +340,7 @@ def draw_onion_callback():
         return
 
     current_frame = scene.frame_current
+
     cache = get_cache()
     
     # Determine which frames to show based on mode
@@ -148,6 +380,18 @@ def draw_onion_callback():
             if not strokes:
                 continue
 
+            # v7.2: Apply baked offset for THIS onion skin frame
+            z_offset = 0.0
+            if settings.depth_interaction_enabled and is_bake_valid():
+                baked_offset = get_baked_offset(frame)
+                if baked_offset is not None:
+                    z_offset = baked_offset
+            if settings.stroke_z_offset > 0:
+                z_offset += settings.stroke_z_offset
+
+            # DEBUG: Log onion draw
+            log_onion_draw(current_frame, frame, z_offset, len(strokes))
+
             # Calculate color based on before/after
             if frame < current_frame:
                 base_color = settings.color_before
@@ -180,8 +424,8 @@ def draw_onion_callback():
                 fill_triangles = stroke_data.get('fill_triangles', [])
                 if fill_triangles:
                     points = stroke_data['points']
-                    # Using raw cached world points
-                    coords = [(p.x, p.y, p.z) for p in points]
+                    # v7.2: Apply z_offset to world points
+                    coords = [(p.x, p.y, p.z + z_offset) for p in points]
 
                     # Build triangle vertex list from indices
                     tri_coords = []
@@ -202,7 +446,8 @@ def draw_onion_callback():
 
             for stroke_data in strokes:
                 points = stroke_data['points']
-                coords = [(p.x, p.y, p.z) for p in points]
+                # v7.2: Apply z_offset to world points
+                coords = [(p.x, p.y, p.z + z_offset) for p in points]
 
                 if len(coords) < 2:
                     continue
@@ -439,28 +684,21 @@ def draw_motion_path_callback():
                  points.append(gp_obj.location.copy())
              scene.frame_set(original_frame)
         else:
-             # Evaluate F-Curves + apply shrinkwrap logic manually
+             # Evaluate F-Curves + apply shrinkwrap using BAKED offsets (v7 BULLETPROOF)
              for f in range(start_frame, end_frame + 1, step):
                  x = fc_x.evaluate(f)
                  y = fc_y.evaluate(f)
                  z = fc_z.evaluate(f)
-                 
+
                  pos = Vector((x, y, z))
-                 
+
                  if settings.depth_interaction_enabled:
-                     # Manual raycast logic (same as adjust_obj_to_surface)
-                     ray_origin = Vector((x, y, z + 1000.0))
-                     ray_dir = Vector((0, 0, -1))
-                     # We need depsgraph. scene.ray_cast needs it.
-                     # Ideally we use the evaluated depsgraph from context
-                     try:
-                         depsgraph = bpy.context.evaluated_depsgraph_get()
-                         hit, location, _, _, hit_obj, _ = scene.ray_cast(depsgraph, ray_origin, ray_dir)
-                         if hit and hit_obj != gp_obj:
-                             pos.z = location.z + SURFACE_OFFSET
-                     except:
-                         pass
-                 
+                     # v7.1: Use ONLY baked offsets - no runtime raycast
+                     baked_offset = get_baked_offset(f)
+                     if baked_offset is not None:
+                         pos.z += baked_offset
+                     # No fallback - if not baked, just use raw F-curve position
+
                  points.append(pos)
 
         _motion_path_cache = points

@@ -27,31 +27,26 @@ bl_info = {
 import bpy
 from bpy.app.handlers import persistent
 
-# Handle reloading for development
-if "bpy" in locals():
+# Handle reloading for development - MUST reload in dependency order
+# debug_log first (no deps), transforms, cache, anchors, drawing, handlers, operators, settings, ui
+if "debug_log" in locals():
     import importlib
-    if "transforms" in locals():
-        importlib.reload(transforms)
-    if "cache" in locals():
-        importlib.reload(cache)
-    if "anchors" in locals():
-        importlib.reload(anchors)
-    if "handlers" in locals():
-        importlib.reload(handlers)
-    if "drawing" in locals():
-        importlib.reload(drawing)
-    if "operators" in locals():
-        importlib.reload(operators)
-    if "settings" in locals():
-        importlib.reload(settings)
-    if "ui" in locals():
-        importlib.reload(ui)
+    importlib.reload(debug_log)
+    importlib.reload(transforms)
+    importlib.reload(cache)
+    importlib.reload(anchors)
+    importlib.reload(drawing)
+    importlib.reload(handlers)
+    importlib.reload(operators)
+    importlib.reload(settings)
+    importlib.reload(ui)
 
+from . import debug_log
 from . import transforms
 from . import cache
 from . import anchors
+from . import drawing  # drawing before handlers (handlers imports from drawing)
 from . import handlers
-from . import drawing
 from . import operators
 from . import settings
 from . import ui
@@ -72,6 +67,10 @@ def on_load_post(dummy):
     for scene in bpy.data.scenes:
         if hasattr(scene, 'world_onion') and scene.world_onion.enabled:
             drawing.register_draw_handlers()
+            # v8.5: Start cursor sync modal operator
+            from .operators import is_cursor_sync_running
+            if not is_cursor_sync_running():
+                bpy.ops.world_onion.cursor_sync('INVOKE_DEFAULT')
             break
 
 
@@ -91,6 +90,9 @@ def register():
     if on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(on_load_post)
 
+    # v8.1: Register driver namespace function for shrinkwrap offset lookup
+    drawing.register_driver_namespace()
+
     print("World Space Onion Skin registered")
 
 
@@ -99,6 +101,11 @@ def unregister():
     # Unregister load handler
     if on_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(on_load_post)
+
+    # v8.1: Unregister driver namespace function
+    drawing.unregister_driver_namespace()
+
+    # v8.5: Modal operator auto-cancels when addon disables (no explicit stop needed)
 
     # Unregister draw handlers
     drawing.unregister_draw_handlers()

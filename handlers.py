@@ -15,8 +15,9 @@ from .anchors import (
     get_visible_keyframe,
     migrate_anchor_data,
 )
-from .transforms import align_canvas_to_cursor, get_camera_direction, ensure_billboard_constraint, adjust_obj_to_surface
+from .transforms import align_canvas_to_cursor, get_camera_direction, ensure_billboard_constraint
 from .drawing import invalidate_motion_path
+from .debug_log import log, log_frame_change
 
 
 # Global tracking state
@@ -24,6 +25,10 @@ _last_keyframe_set = set()
 _last_active_layer_name = None
 _last_active_gp = None  # Track active GP object for change detection
 _in_depsgraph_handler = False  # Prevent recursive handler calls
+# v8.5.2: Cursor sync uses shared tracker in operators.py for modal+handler coordination
+
+# v8: Timer/handler-based offset application REMOVED
+# The driver on delta_location.z handles offset automatically now!
 
 
 def get_last_keyframe_set():
@@ -54,9 +59,8 @@ def on_frame_change(scene):
     """
     Called AFTER frame change is complete.
     Caches the current frame's world-space strokes.
-    Handles auto-move cursor.
     Ensures billboard constraint.
-    Handles soft shrinkwrap.
+    v8.5.2: Hybrid cursor sync - handler catches frames missed by modal during playback.
     """
     global _last_keyframe_set
 
@@ -75,46 +79,37 @@ def on_frame_change(scene):
     # Ensure billboard constraint is active
     ensure_billboard_constraint(gp_obj, scene)
 
-    # === SHRINKWRAP BEHAVIOR ===
-    # If enabled, adjust object location to sit on mesh surface
-    # This overrides the F-Curve interpolated value for the current frame
-    if settings.depth_interaction_enabled:
-        adjust_obj_to_surface(gp_obj, scene)
+    # === v8: DRIVER HANDLES OFFSET AUTOMATICALLY ===
+    # The driver on delta_location.z reads from the animated custom property
+    # "_shrinkwrap_z_offset" which was baked during the bake operation.
+    # No Python code needed here - Blender's native driver system handles it!
 
-    # === Z OFFSET ===
-    # Apply global Z offset to push strokes above mesh
-    if settings.stroke_z_offset > 0:
-        try:
-            gp_obj.location.z += settings.stroke_z_offset
-        except AttributeError:
-            # Writing not allowed in this context (render, playback, etc.)
-            pass
-
-    # === FORCE DEPSGRAPH UPDATE ===
-    # After shrinkwrap/Z-offset modifies location, force matrix_world recalculation
-    # so cache captures the correct world-space positions
-    if settings.depth_interaction_enabled or settings.stroke_z_offset > 0:
-        try:
-            bpy.context.view_layer.update()
-        except (RuntimeError, AttributeError):
-            pass
+    # === ONION SKIN CACHE ===
+    # Cache strokes for onion skin drawing
+    # Note: The driver applies offset via delta_location, but we cache the
+    # "raw" stroke positions (from matrix_world without delta). The offset
+    # is applied during GPU drawing via get_baked_offset(frame).
+    cache_current_frame(gp_obj, settings)
 
     # === ANCHOR SYSTEM ===
     if settings.anchor_enabled:
         # Update keyframe tracking set on frame change
         _last_keyframe_set = get_current_keyframes_set(gp_obj, settings)
 
-        # Auto-move cursor to object location
+        # v8.5.2: Hybrid cursor sync - handler catches frames missed by modal
+        # Only update if modal hasn't already handled this frame (prevents jitter)
         if settings.anchor_auto_cursor:
-            scene.cursor.location = gp_obj.location
-            
-            try:
-                align_canvas_to_cursor(bpy.context)
-            except (RuntimeError, AttributeError):
-                pass
-
-    # === ONION SKIN CACHE ===
-    cache_current_frame(gp_obj, settings)
+            from .operators import get_last_cursor_synced_frame, set_last_cursor_synced_frame
+            current_frame = scene.frame_current
+            if current_frame != get_last_cursor_synced_frame():
+                try:
+                    depsgraph = bpy.context.evaluated_depsgraph_get()
+                    gp_obj_eval = gp_obj.evaluated_get(depsgraph)
+                    scene.cursor.location = gp_obj_eval.matrix_world.translation
+                    set_last_cursor_synced_frame(current_frame)
+                    log(f"HANDLER_CURSOR frame={current_frame}", "CURSOR")
+                except (RuntimeError, AttributeError):
+                    pass  # Context unavailable
 
     # === MOTION PATH ===
     if settings.motion_path_enabled:
@@ -163,6 +158,9 @@ def _on_depsgraph_update_impl(scene, depsgraph):
 
     # Get active GP object
     gp_obj = get_active_gp(bpy.context)
+
+    # v8.5: Cursor update moved to modal operator (WONION_OT_cursor_sync)
+    # The modal handles cursor updates reliably - no backup needed here.
 
     # Detect active GP object change - clear cache when switching
     if gp_obj != _last_active_gp:

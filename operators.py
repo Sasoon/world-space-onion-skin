@@ -17,7 +17,105 @@ from .anchors import (
     get_visible_keyframe,
 )
 from .transforms import get_layer_transform, get_camera_direction, align_canvas_to_cursor, ensure_billboard_constraint
-from .drawing import invalidate_motion_path
+from .drawing import invalidate_motion_path, get_baked_offset
+from .debug_log import log
+
+# v8.5: Track if cursor sync modal is running
+_cursor_sync_running = False
+
+# v8.5.2: Shared frame tracker for hybrid cursor sync (modal + handler coordination)
+# This prevents double-updates which cause jitter
+_last_cursor_synced_frame = None
+
+
+def is_cursor_sync_running():
+    """Check if cursor sync modal operator is running."""
+    return _cursor_sync_running
+
+
+def set_cursor_sync_running(value):
+    """Set cursor sync modal operator running state."""
+    global _cursor_sync_running
+    _cursor_sync_running = value
+
+
+def get_last_cursor_synced_frame():
+    """Get the last frame cursor was synced for (used by handler to avoid double-update)."""
+    return _last_cursor_synced_frame
+
+
+def set_last_cursor_synced_frame(frame):
+    """Set the last frame cursor was synced for."""
+    global _last_cursor_synced_frame
+    _last_cursor_synced_frame = frame
+
+
+class WONION_OT_cursor_sync(bpy.types.Operator):
+    """Background operator to sync cursor with GP object during playback"""
+    bl_idname = "world_onion.cursor_sync"
+    bl_label = "Cursor Sync"
+    bl_options = {'INTERNAL'}
+
+    _timer = None
+    _last_frame = None
+
+    def modal(self, context, event):
+        # Check if addon still enabled
+        if not hasattr(context.scene, 'world_onion'):
+            self.cancel(context)
+            return {'CANCELLED'}
+
+        settings = context.scene.world_onion
+        if not settings.enabled:
+            self.cancel(context)
+            return {'CANCELLED'}
+
+        if event.type == 'TIMER':
+            # Update cursor if needed
+            if settings.anchor_enabled and settings.anchor_auto_cursor:
+                current_frame = context.scene.frame_current
+                # v8.5.3: Check BOTH instance state AND shared tracker
+                # Skip if handler already updated this frame (prevents double-update jitter)
+                if (current_frame != self._last_frame and
+                    current_frame != get_last_cursor_synced_frame()):
+                    self._last_frame = current_frame
+                    gp_obj = get_active_gp(context)
+                    if gp_obj:
+                        try:
+                            depsgraph = context.evaluated_depsgraph_get()
+                            gp_obj_eval = gp_obj.evaluated_get(depsgraph)
+                            context.scene.cursor.location = gp_obj_eval.matrix_world.translation
+                            # Mark frame as synced so handler doesn't double-update
+                            set_last_cursor_synced_frame(current_frame)
+                            # Log for debugging
+                            log(f"MODAL_CURSOR frame={current_frame}", "CURSOR")
+                        except Exception as e:
+                            log(f"MODAL_CURSOR frame={current_frame} FAILED: {e}", "ERROR")
+
+        return {'PASS_THROUGH'}
+
+    def execute(self, context):
+        global _cursor_sync_running
+        if _cursor_sync_running:
+            # Already running
+            return {'CANCELLED'}
+
+        wm = context.window_manager
+        # v8.5.1: Increased polling rate to 200fps (5ms) to reduce cursor lag during scrubbing
+        # Higher frequency = less time between frame change and cursor update
+        self._timer = wm.event_timer_add(0.005, window=context.window)
+        wm.modal_handler_add(self)
+        _cursor_sync_running = True
+        log("Cursor sync modal started (5ms interval)", "INFO")
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        global _cursor_sync_running
+        if self._timer:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+        _cursor_sync_running = False
+        log("Cursor sync modal stopped", "INFO")
 
 
 class WONION_OT_clear_cache(bpy.types.Operator):
@@ -259,7 +357,13 @@ class WONION_OT_snap_to_gp(bpy.types.Operator):
             scene.cursor.location = anchor_pos
             cam_dir = get_camera_direction(scene)
             set_anchor_for_frame(gp_obj, active_layer.name, scene.frame_current, anchor_pos, cam_dir)
-            
+
+            # v9.1.2: Auto-bake shrinkwrap after snap
+            if settings.depth_interaction_enabled:
+                from .drawing import bake_shrinkwrap_offsets
+                bake_shrinkwrap_offsets(gp_obj, settings, scene)
+                context.view_layer.update()
+
         return result
 
 
@@ -280,20 +384,27 @@ class WONION_OT_snap_to_cursor(bpy.types.Operator):
             return {'CANCELLED'}
 
         scene = context.scene
+        settings = scene.world_onion
         cursor_pos = scene.cursor.location.copy()
 
         # Note: Z offset is NOT applied here - it's applied in on_frame_change
         # to avoid double-application (baked in keyframe + applied on frame change)
 
         result = set_anchor_logic(context, gp_obj, scene, cursor_pos, move_selected_strokes_to_target=True)
-        
+
         if result == {'FINISHED'}:
             self.report({'INFO'}, "Snapped strokes and Object to Cursor")
             active_layer = gp_obj.data.layers.active
             if active_layer:
                 cam_dir = get_camera_direction(scene)
                 set_anchor_for_frame(gp_obj, active_layer.name, scene.frame_current, cursor_pos, cam_dir)
-                
+
+            # v9.1.2: Auto-bake shrinkwrap after snap
+            if settings.depth_interaction_enabled:
+                from .drawing import bake_shrinkwrap_offsets
+                bake_shrinkwrap_offsets(gp_obj, settings, scene)
+                context.view_layer.update()
+
         return result
 
 
@@ -385,8 +496,53 @@ class WONION_OT_reload_addon(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class WONION_OT_bake_shrinkwrap(bpy.types.Operator):
+    """Bake shrinkwrap offsets for entire animation range"""
+    bl_idname = "world_onion.bake_shrinkwrap"
+    bl_label = "Bake Shrinkwrap"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = context.scene.world_onion
+        return (get_active_gp(context) is not None and
+                settings.enabled and
+                settings.depth_interaction_enabled)
+
+    def execute(self, context):
+        from .drawing import bake_shrinkwrap_offsets
+
+        gp_obj = get_active_gp(context)
+        settings = context.scene.world_onion
+
+        count = bake_shrinkwrap_offsets(gp_obj, settings, context.scene)
+
+        # v9.1.1: Force depsgraph update and cursor sync after bake
+        # Without this, driver hasn't evaluated yet and cursor is at wrong position
+        context.view_layer.update()
+
+        # Sync cursor to GP object's new position (with offset applied)
+        if settings.anchor_enabled and settings.anchor_auto_cursor:
+            try:
+                depsgraph = context.evaluated_depsgraph_get()
+                gp_obj_eval = gp_obj.evaluated_get(depsgraph)
+                context.scene.cursor.location = gp_obj_eval.matrix_world.translation
+            except:
+                pass
+
+        self.report({'INFO'}, f"Baked shrinkwrap for {count} frames")
+
+        # Force redraw
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+        return {'FINISHED'}
+
+
 # List of operator classes for registration
 operator_classes = (
+    WONION_OT_cursor_sync,  # v8.5: Modal timer for cursor sync
     WONION_OT_clear_cache,
     WONION_OT_build_cache,
     WONION_OT_set_anchor,
@@ -395,4 +551,5 @@ operator_classes = (
     WONION_OT_clear_anchor,
     WONION_OT_clear_all_anchors,
     WONION_OT_reload_addon,
+    WONION_OT_bake_shrinkwrap,
 )

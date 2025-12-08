@@ -5,15 +5,25 @@ Settings and property definitions for world-space onion skinning.
 import bpy
 
 from .cache import clear_cache, cache_current_frame, get_active_gp
-from .drawing import register_draw_handlers, unregister_draw_handlers
+from .drawing import (
+    register_draw_handlers, unregister_draw_handlers,
+    bake_shrinkwrap_offsets, invalidate_baked_offsets,
+    invalidate_motion_path, remove_shrinkwrap_driver,
+)
 from .anchors import get_current_keyframes_set
 from .handlers import set_last_keyframe_set, set_last_active_layer_name
+from .transforms import align_canvas_to_cursor
 
 
 def update_enabled(self, context):
     """Called when addon is enabled/disabled."""
     if self.enabled:
         register_draw_handlers()
+        # v8.5: Start cursor sync modal operator for reliable cursor tracking
+        # Import here to avoid circular import
+        from .operators import is_cursor_sync_running
+        if not is_cursor_sync_running():
+            bpy.ops.world_onion.cursor_sync('INVOKE_DEFAULT')
 
         # Cache current frame immediately if GP is active
         gp_obj = get_active_gp(context)
@@ -22,6 +32,7 @@ def update_enabled(self, context):
             set_last_keyframe_set(get_current_keyframes_set(gp_obj, self))
     else:
         unregister_draw_handlers()
+        # v8.5: Modal operator auto-cancels when addon is disabled (checks in modal())
 
     # Redraw viewports
     for window in context.window_manager.windows:
@@ -38,16 +49,52 @@ def update_setting(self, context):
             area.tag_redraw()
 
 
+def update_anchor_enabled(self, context):
+    """Called when anchor system is enabled/disabled.
+
+    v8.2: Canvas alignment is done HERE (once) instead of every frame change.
+    This avoids 'Writing to ID classes not allowed' errors during timeline scrubbing.
+    """
+    if self.anchor_enabled:
+        # Set canvas to follow cursor - this setting PERSISTS
+        try:
+            align_canvas_to_cursor(context)
+        except (RuntimeError, AttributeError):
+            pass  # May fail in some contexts, but that's OK - user can trigger manually
+
+    # Redraw viewports
+    for area in context.screen.areas:
+        if area.type in ('VIEW_3D', 'DOPESHEET_EDITOR', 'TIMELINE'):
+            area.tag_redraw()
+
+
 def update_realtime(self, context):
     """Called when realtime settings change (Z offset, shrinkwrap) - apply immediately."""
     # Clear stale cached data so strokes are recalculated with new settings
     clear_cache()
 
+    # Auto-bake shrinkwrap offsets when shrinkwrap is enabled
+    # This ensures we have baked data before playback starts
+    # v8: bake_shrinkwrap_offsets also sets up the driver on delta_location.z
+    if self.depth_interaction_enabled:
+        gp_obj = get_active_gp(context)
+        if gp_obj:
+            bake_shrinkwrap_offsets(gp_obj, self, context.scene)
+    else:
+        # Shrinkwrap disabled - invalidate baked data and remove driver
+        invalidate_baked_offsets()
+        gp_obj = get_active_gp(context)
+        if gp_obj:
+            remove_shrinkwrap_driver(gp_obj)
+
+    # Invalidate motion path so it rebuilds
+    invalidate_motion_path()
+
     # Force frame re-evaluation to apply the change
     scene = context.scene
     current_frame = scene.frame_current
     scene.frame_set(current_frame)
-    
+
     for area in context.screen.areas:
         if area.type == 'VIEW_3D':
             area.tag_redraw()
@@ -146,7 +193,7 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         name="Enable Anchors",
         description="Enable anchor system for world-space drawing",
         default=False,
-        update=update_setting,
+        update=update_anchor_enabled,  # v8.2: Canvas alignment done once here
     )
     
     anchor_auto_cursor: bpy.props.BoolProperty(
