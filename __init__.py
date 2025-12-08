@@ -40,8 +40,6 @@ if "bpy" in locals():
         importlib.reload(handlers)
     if "drawing" in locals():
         importlib.reload(drawing)
-    if "timeline_drawing" in locals():
-        importlib.reload(timeline_drawing)
     if "operators" in locals():
         importlib.reload(operators)
     if "settings" in locals():
@@ -54,7 +52,6 @@ from . import cache
 from . import anchors
 from . import handlers
 from . import drawing
-from . import timeline_drawing
 from . import operators
 from . import settings
 from . import ui
@@ -90,9 +87,6 @@ def register():
     # Register handlers
     handlers.register_handlers()
 
-    # Register timeline drawing
-    timeline_drawing.register_timeline_handlers()
-
     # Register load handler to restore draw callbacks after file load
     if on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(on_load_post)
@@ -108,9 +102,6 @@ def unregister():
 
     # Unregister draw handlers
     drawing.unregister_draw_handlers()
-
-    # Unregister timeline drawing
-    timeline_drawing.unregister_timeline_handlers()
 
     # Unregister handlers
     handlers.unregister_handlers()

@@ -102,3 +102,69 @@ def align_canvas_to_cursor(context):
                     overlay.gpencil_grid_offset[0] = 0.0
                     overlay.gpencil_grid_offset[1] = half_height
                     break
+
+
+def ensure_billboard_constraint(gp_obj, scene):
+    """Ensure the GP object has a billboard constraint targeting the active camera.
+    
+    Adds a COPY_ROTATION constraint if missing.
+    Updates target if camera changed.
+    """
+    if gp_obj is None:
+        return
+
+    camera = scene.camera
+    if camera is None:
+        return
+
+    CONSTRAINT_NAME = "WorldOnion_Billboard"
+
+    # Find existing constraint
+    constraint = gp_obj.constraints.get(CONSTRAINT_NAME)
+    
+    if constraint is None:
+        constraint = gp_obj.constraints.new(type='COPY_ROTATION')
+        constraint.name = CONSTRAINT_NAME
+        constraint.use_x = True
+        constraint.use_y = True
+        constraint.use_z = True
+        constraint.mix_mode = 'REPLACE'
+        constraint.target_space = 'WORLD'
+        constraint.owner_space = 'WORLD'
+    
+    # Ensure target is correct
+    if constraint.target != camera:
+        constraint.target = camera
+
+
+def adjust_obj_to_surface(gp_obj, scene):
+    """
+    Adjust GP object location to sit on mesh surface (raycast down).
+    Used for shrinkwrap behavior without baking keys or constraints.
+    Returns True if adjusted.
+    """
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    except (RuntimeError, AttributeError):
+        return False
+
+    # Current location (likely from F-Curve)
+    current_pos = gp_obj.location
+    
+    # Raycast down from above
+    ray_origin = Vector((current_pos.x, current_pos.y, current_pos.z + 1000.0))
+    ray_dir = Vector((0, 0, -1))
+    
+    hit, location, normal, index, hit_obj, matrix = scene.ray_cast(
+        depsgraph, ray_origin, ray_dir
+    )
+    
+    # Ignore self (the GP object itself won't be hit by ray_cast usually, but to be safe)
+    if hit and hit_obj != gp_obj:
+        new_z = location.z + SURFACE_OFFSET
+        # Only update if significant change to avoid float jitter fighting F-Curve
+        if abs(new_z - current_pos.z) > 0.0001:
+            gp_obj.location.z = new_z
+            return True
+            
+    return False

@@ -189,32 +189,7 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         default=True,
     )
 
-    # Timeline indicator properties
-    show_timeline_indicator: bpy.props.BoolProperty(
-        name="Timeline Indicator",
-        description="Show world-lock indicators on keyframes in Dopesheet/Timeline",
-        default=True,
-        update=update_setting,
-    )
-
-    timeline_lock_color: bpy.props.FloatVectorProperty(
-        name="Lock Color",
-        description="Color for world-locked keyframe indicators in timeline",
-        subtype='COLOR',
-        size=3,
-        default=(1.0, 0.6, 0.0),  # Orange
-        min=0.0, max=1.0,
-        update=update_setting,
-    )
-
-    timeline_line_width: bpy.props.FloatProperty(
-        name="Line Width",
-        description="Width of the timeline lock indicator line",
-        default=3.0, min=1.0, max=10.0,
-        update=update_setting,
-    )
-
-    # Motion path properties
+    # Motion path properties (simplified/native fallback)
     motion_path_enabled: bpy.props.BoolProperty(
         name="Show Motion Path",
         description="Draw a line connecting anchor positions across locked frames",
@@ -250,14 +225,6 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         name="Smoothing",
         description="Subdivisions for smooth curves (0=sharp, higher=smoother)",
         default=0, min=0, max=200,
-        update=update_setting,
-    )
-
-    # Interpolation properties
-    interpolation_enabled: bpy.props.BoolProperty(
-        name="Interpolate Positions",
-        description="Interpolate GP position between locked frames. Uses GP keyframe type (T key): Breakdown=Linear, Moving Hold=Bezier",
-        default=False,
         update=update_setting,
     )
 

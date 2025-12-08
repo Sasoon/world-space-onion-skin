@@ -2,7 +2,6 @@
 Cache management for world-space onion skinning.
 """
 
-import json
 import bpy
 from mathutils import Vector
 from mathutils.geometry import tessellate_polygon
@@ -16,57 +15,6 @@ def get_active_gp(context):
     if obj is not None and obj.type == 'GREASEPENCIL':
         return obj
     return None
-
-
-def get_all_world_locked_gp_objects(scene):
-    """Get GP objects in current scene that have world-locked frames.
-
-    Checks the new object-level lock property (world_onion_locks).
-    Falls back to checking old layer-level property for migration.
-    This is used to apply world lock transforms even when the GP object isn't selected.
-    """
-    locked_objects = []
-
-    # Only check objects in current scene (not all bpy.data.objects)
-    for obj in scene.objects:
-        if obj.type != 'GREASEPENCIL':
-            continue
-
-        has_lock = False
-
-        # Check new object-level locks first
-        if "world_onion_locks" in obj:
-            try:
-                locks = json.loads(obj["world_onion_locks"])
-                for frame_data in locks.values():
-                    if isinstance(frame_data, dict) and frame_data.get("world_locked"):
-                        has_lock = True
-                        break
-            except (json.JSONDecodeError, TypeError, KeyError):
-                # Invalid or corrupted lock data
-                pass
-
-        # Fall back to old layer-level locks (for migration)
-        if not has_lock and "world_onion_anchors" in obj:
-            try:
-                anchors = json.loads(obj["world_onion_anchors"])
-                for layer_data in anchors.values():
-                    if not isinstance(layer_data, dict):
-                        continue
-                    for frame_data in layer_data.values():
-                        if isinstance(frame_data, dict) and frame_data.get("world_locked"):
-                            has_lock = True
-                            break
-                    if has_lock:
-                        break
-            except (json.JSONDecodeError, TypeError, KeyError):
-                # Invalid or corrupted anchor data
-                pass
-
-        if has_lock:
-            locked_objects.append(obj)
-
-    return locked_objects
 
 
 def triangulate_fill(world_points):
@@ -215,20 +163,26 @@ def extract_strokes_at_current_frame(gp_obj, settings):
 
 
 def cache_current_frame(gp_obj, settings):
-    """Cache strokes for the current frame.
-
-    In KEYFRAMES mode with interpolation, skip caching non-keyframes.
-    Drawing code computes offset from cached stroke positions to motion path.
-    """
+    """Cache strokes for the current frame."""
     global _cache
     frame = bpy.context.scene.frame_current
 
-    # In KEYFRAMES mode with interpolation, skip caching non-keyframes
-    if settings.mode == 'KEYFRAMES' and settings.interpolation_enabled:
-        from .anchors import get_interpolated_position
-        _, interp_info = get_interpolated_position(gp_obj, frame)
-        if interp_info is not None:
-            return
+    # In KEYFRAMES mode, only cache if this is effectively a keyframe
+    # We can check if any layer has a keyframe at exactly this frame
+    is_keyframe = False
+    for layer in gp_obj.data.layers:
+        for kf in layer.frames:
+            if kf.frame_number == frame:
+                is_keyframe = True
+                break
+        if is_keyframe:
+            break
+
+    # If we are in 'KEYFRAMES' mode and strictly want only keyframes
+    # (assuming settings.interpolation_enabled used to guard this)
+    # For now, let's just cache if it IS a keyframe, or if we are in FRAMES mode.
+    if settings.mode == 'KEYFRAMES' and not is_keyframe:
+         return
 
     strokes = extract_strokes_at_current_frame(gp_obj, settings)
     _cache[frame] = strokes

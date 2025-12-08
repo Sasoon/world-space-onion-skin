@@ -8,8 +8,8 @@ from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 
 from .cache import get_cache, get_active_gp
-from .anchors import get_all_anchor_positions, get_all_locked_frames, get_interpolated_position
-from .transforms import SURFACE_OFFSET, catmull_rom_point
+from .anchors import get_all_anchor_positions
+from .transforms import SURFACE_OFFSET, catmull_rom_point, adjust_obj_to_surface
 
 
 # Draw handler references
@@ -50,18 +50,7 @@ def invalidate_motion_path():
 
 
 def adjust_path_points_to_mesh(points, scene):
-    """Adjust path points to sit on mesh surface (shrinkwrap effect).
-
-    For each point, casts a ray straight down to find any mesh surface,
-    then adjusts Z to be on that surface plus a small offset for visibility.
-
-    Args:
-        points: List of (x, y, z) tuples
-        scene: Current scene
-
-    Returns:
-        List of adjusted (x, y, z) tuples
-    """
+    """Adjust path points to sit on mesh surface (shrinkwrap effect)."""
     try:
         depsgraph = bpy.context.evaluated_depsgraph_get()
     except (RuntimeError, AttributeError):
@@ -159,36 +148,6 @@ def draw_onion_callback():
             if not strokes:
                 continue
 
-            # Compute offset to position strokes correctly on motion path
-            offset = Vector((0, 0, 0))
-
-            # Check if interpolation is enabled - use motion path positions
-            if settings.interpolation_enabled:
-                # Get current position on motion path for this frame
-                interp_pos, interp_info = get_interpolated_position(gp_obj, frame)
-
-                if interp_pos is None:
-                    # Frame is outside locked range - skip it
-                    continue
-
-                # Compute anchor position of cached strokes (center X/Y, min Z)
-                all_points = []
-                for stroke_data in strokes:
-                    all_points.extend(stroke_data['points'])
-
-                if all_points:
-                    sum_x, sum_y = 0.0, 0.0
-                    min_z = float('inf')
-                    for p in all_points:
-                        sum_x += p.x
-                        sum_y += p.y
-                        min_z = min(min_z, p.z)
-                    n = len(all_points)
-                    cached_anchor = Vector((sum_x / n, sum_y / n, min_z))
-
-                    # Offset from cached anchor to motion path position
-                    offset = interp_pos - cached_anchor
-
             # Calculate color based on before/after
             if frame < current_frame:
                 base_color = settings.color_before
@@ -220,9 +179,9 @@ def draw_onion_callback():
             for stroke_data in strokes:
                 fill_triangles = stroke_data.get('fill_triangles', [])
                 if fill_triangles:
-                    # Apply offset for locked frames
                     points = stroke_data['points']
-                    coords = [(p.x + offset.x, p.y + offset.y, p.z + offset.z) for p in points]
+                    # Using raw cached world points
+                    coords = [(p.x, p.y, p.z) for p in points]
 
                     # Build triangle vertex list from indices
                     tri_coords = []
@@ -242,9 +201,8 @@ def draw_onion_callback():
             stroke_shader.uniform_float("color", stroke_color)
 
             for stroke_data in strokes:
-                # Apply offset for locked frames
                 points = stroke_data['points']
-                coords = [(p.x + offset.x, p.y + offset.y, p.z + offset.z) for p in points]
+                coords = [(p.x, p.y, p.z) for p in points]
 
                 if len(coords) < 2:
                     continue
@@ -336,7 +294,6 @@ def draw_anchor_callback():
     try:
         scene = bpy.context.scene
     except (RuntimeError, AttributeError):
-        # Context unavailable during render or background operations
         return
 
     if not hasattr(scene, 'world_onion'):
@@ -412,11 +369,9 @@ def draw_anchor_callback():
 
 def draw_motion_path_callback():
     """
-    GPU draw callback - renders motion path connecting anchor positions.
-    Shows the trajectory of movement across ALL frames with anchor data.
-    - Solid line: segment starts from a LOCKED frame (strokes follow path)
-    - Dashed line: segment starts from an UNLOCKED frame (strokes glued to camera)
-    Uses caching for performance - only rebuilds when invalidated.
+    GPU draw callback - renders motion path connecting object locations.
+    Samples F-Curves to draw path.
+    Respects depth interaction (shrinkwrap) if enabled.
     """
     global _motion_path_cache, _motion_path_cache_gp, _motion_path_dirty
 
@@ -443,117 +398,85 @@ def draw_motion_path_callback():
 
     # Check if cache needs rebuild (dirty or different GP object)
     if _motion_path_dirty or _motion_path_cache is None or _motion_path_cache_gp != gp_obj:
-        # Rebuild cache - include ALL frames with anchor_world (locked AND unlocked)
-        all_frames = get_all_locked_frames(gp_obj, include_data=True, include_unlocked_anchors=True)
-
-        if len(all_frames) < 2:
+        # Rebuild cache by sampling object animation data
+        # Only if there is animation data
+        if not gp_obj.animation_data or not gp_obj.animation_data.action:
             _motion_path_cache = None
             _motion_path_cache_gp = gp_obj
             _motion_path_dirty = False
             return
 
-        # Sort by frame number and extract positions with lock status
-        sorted_frames = sorted(all_frames.items(), key=lambda x: int(x[0]))
+        # Find frame range of keyframes
+        start_frame = int(gp_obj.animation_data.action.frame_range[0])
+        end_frame = int(gp_obj.animation_data.action.frame_range[1])
+        
+        if start_frame == end_frame:
+            return
 
-        # Cache structure: list of (position, is_locked) tuples
-        path_data = []
-        for frame_str, lock_data in sorted_frames:
-            if 'anchor_world' in lock_data:
-                pos = tuple(lock_data['anchor_world'])
-                is_locked = lock_data.get('world_locked', False)
-                path_data.append((pos, is_locked))
+        # Sample path
+        # Determine step based on duration to avoid too many points
+        duration = end_frame - start_frame
+        step = max(1, duration // 100)  # Limit to ~100 points
+        
+        points = []
+        
+        # Save current frame
+        original_frame = scene.frame_current
+        
+        # Sample frames
+        # Note: This is slow-ish but necessary to see evaluated positions
+        # Faster way is evaluation via fcurves directly but that ignores constraints?
+        # Actually we want to visualize the F-Curve + Raycast adjustment.
+        # Since we adjust in frame_change_post, standard evaluation doesn't show it unless we run the handler logic here.
+        
+        # Optimization: Just evaluate F-Curves for raw position, then apply raycast logic
+        # This avoids scene.frame_set() overhead
+        
+        # Get location fcurves
+        fcurves = gp_obj.animation_data.action.fcurves
+        fc_x = fcurves.find('location', index=0)
+        fc_y = fcurves.find('location', index=1)
+        fc_z = fcurves.find('location', index=2)
+        
+        if not fc_x or not fc_y or not fc_z:
+             # Fallback to frame_set if incomplete
+             for f in range(start_frame, end_frame + 1, step):
+                 scene.frame_set(f)
+                 # Our handler runs on frame_set, so gp_obj.location is adjusted
+                 points.append(gp_obj.location.copy())
+             scene.frame_set(original_frame)
+        else:
+             # Evaluate F-Curves + apply shrinkwrap logic manually
+             for f in range(start_frame, end_frame + 1, step):
+                 x = fc_x.evaluate(f)
+                 y = fc_y.evaluate(f)
+                 z = fc_z.evaluate(f)
+                 
+                 pos = Vector((x, y, z))
+                 
+                 if settings.depth_interaction_enabled:
+                     # Manual raycast logic (same as adjust_obj_to_surface)
+                     ray_origin = Vector((x, y, z + 1000.0))
+                     ray_dir = Vector((0, 0, -1))
+                     # We need depsgraph. scene.ray_cast needs it.
+                     # Ideally we use the evaluated depsgraph from context
+                     try:
+                         depsgraph = bpy.context.evaluated_depsgraph_get()
+                         hit, location, _, _, hit_obj, _ = scene.ray_cast(depsgraph, ray_origin, ray_dir)
+                         if hit and hit_obj != gp_obj:
+                             pos.z = location.z + SURFACE_OFFSET
+                     except:
+                         pass
+                 
+                 points.append(pos)
 
-        _motion_path_cache = path_data if len(path_data) >= 2 else None
+        _motion_path_cache = points
         _motion_path_cache_gp = gp_obj
         _motion_path_dirty = False
 
-    path_data = _motion_path_cache
-    if path_data is None or len(path_data) < 2:
+    path_points = _motion_path_cache
+    if not path_points or len(path_points) < 2:
         return
-
-    # Extract just positions for smoothing/depth
-    path_points = [p[0] for p in path_data]
-
-    # Apply smoothing if enabled
-    smoothing = settings.motion_path_smoothing
-
-    # Collect shrinkwrapped anchor positions for point drawing
-    shrinkwrapped_locked_points = []
-    shrinkwrapped_unlocked_points = []
-
-    if smoothing > 0:
-        # For smoothing, we need to track which segment each smoothed point belongs to
-        # Build segments with their lock status, then smooth each segment
-        solid_segments = []  # List of point lists for solid (locked) segments
-        dashed_segments = []  # List of point lists for dashed (unlocked) segments
-
-        for i in range(len(path_data) - 1):
-            start_pos, start_locked = path_data[i]
-            end_pos, end_locked = path_data[i + 1]
-
-            # Generate smoothed points for this segment
-            if len(path_points) >= 2:
-                # Get control points for Catmull-Rom
-                p0 = path_points[max(0, i - 1)]
-                p1 = start_pos
-                p2 = end_pos
-                p3 = path_points[min(len(path_points) - 1, i + 2)]
-
-                segment_points = [p1]
-                for j in range(1, smoothing + 1):
-                    t = j / (smoothing + 1)
-                    pt = catmull_rom_point(p0, p1, p2, p3, t)
-                    segment_points.append(pt)
-                segment_points.append(p2)
-            else:
-                segment_points = [start_pos, end_pos]
-
-            # Apply depth interaction if enabled
-            if settings.depth_interaction_enabled:
-                segment_points = adjust_path_points_to_mesh(segment_points, scene)
-
-            # Collect shrinkwrapped anchor positions
-            if start_locked:
-                shrinkwrapped_locked_points.append(segment_points[0])
-                solid_segments.append(segment_points)
-            else:
-                shrinkwrapped_unlocked_points.append(segment_points[0])
-                dashed_segments.append(segment_points)
-
-            # Last anchor point (from final segment's end)
-            if i == len(path_data) - 2:
-                if end_locked:
-                    shrinkwrapped_locked_points.append(segment_points[-1])
-                else:
-                    shrinkwrapped_unlocked_points.append(segment_points[-1])
-    else:
-        # No smoothing - just separate into segments by lock status
-        solid_segments = []
-        dashed_segments = []
-
-        for i in range(len(path_data) - 1):
-            start_pos, start_locked = path_data[i]
-            end_pos, end_locked = path_data[i + 1]
-            segment_points = [start_pos, end_pos]
-
-            # Apply depth interaction if enabled
-            if settings.depth_interaction_enabled:
-                segment_points = adjust_path_points_to_mesh(segment_points, scene)
-
-            # Collect shrinkwrapped anchor positions
-            if start_locked:
-                shrinkwrapped_locked_points.append(segment_points[0])
-                solid_segments.append(segment_points)
-            else:
-                shrinkwrapped_unlocked_points.append(segment_points[0])
-                dashed_segments.append(segment_points)
-
-            # Last anchor point (from final segment's end)
-            if i == len(path_data) - 2:
-                if end_locked:
-                    shrinkwrapped_locked_points.append(segment_points[-1])
-                else:
-                    shrinkwrapped_unlocked_points.append(segment_points[-1])
 
     # Set up GPU state
     gpu.state.blend_set('ALPHA')
@@ -561,46 +484,29 @@ def draw_motion_path_callback():
     gpu.state.depth_mask_set(False)
 
     color = tuple(settings.motion_path_color)
-    # Inactive (unlocked) color: red with same alpha
-    inactive_color = (0.9, 0.2, 0.2, color[3] * 0.8)
     region = bpy.context.region
 
     line_shader = _get_stroke_shader()  # Use cached shader
     line_shader.bind()  # Bind once
     line_shader.uniform_float("viewportSize", (region.width, region.height))
     line_shader.uniform_float("lineWidth", settings.motion_path_width)
-
-    # Draw solid segments (active/locked) - normal color
     line_shader.uniform_float("color", color)
-    for segment in solid_segments:
-        if len(segment) >= 2:
-            batch = batch_for_shader(line_shader, 'LINE_STRIP', {"pos": segment})
-            batch.draw(line_shader)
 
-    # Draw inactive segments (unlocked) - red color
-    line_shader.uniform_float("color", inactive_color)
-    for segment in dashed_segments:
-        if len(segment) >= 2:
-            batch = batch_for_shader(line_shader, 'LINE_STRIP', {"pos": segment})
-            batch.draw(line_shader)
+    # Draw path
+    # Convert Vectors to tuples for batch
+    coords = [(p.x, p.y, p.z) for p in path_points]
+    
+    batch = batch_for_shader(line_shader, 'LINE_STRIP', {"pos": coords})
+    batch.draw(line_shader)
 
-    # Draw points at each anchor if enabled (using shrinkwrapped positions)
+    # Draw points
     if settings.motion_path_show_points:
-        point_shader = _get_fill_shader()  # Use cached shader
-        point_shader.bind()  # Bind once
+        point_shader = _get_fill_shader()
+        point_shader.bind()
         gpu.state.point_size_set(8.0)
-
-        # Locked points - full color (shrinkwrapped)
-        if shrinkwrapped_locked_points:
-            point_shader.uniform_float("color", color)
-            batch = batch_for_shader(point_shader, 'POINTS', {"pos": shrinkwrapped_locked_points})
-            batch.draw(point_shader)
-
-        # Unlocked points - red color (shrinkwrapped)
-        if shrinkwrapped_unlocked_points:
-            point_shader.uniform_float("color", inactive_color)
-            batch = batch_for_shader(point_shader, 'POINTS', {"pos": shrinkwrapped_unlocked_points})
-            batch.draw(point_shader)
+        point_shader.uniform_float("color", color)
+        batch = batch_for_shader(point_shader, 'POINTS', {"pos": coords})
+        batch.draw(point_shader)
 
     # Reset GPU state
     gpu.state.blend_set('NONE')
