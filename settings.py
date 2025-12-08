@@ -52,6 +52,18 @@ def update_filter(self, context):
             area.tag_redraw()
 
 
+def update_realtime(self, context):
+    """Called when realtime settings change (Z offset, shrinkwrap) - apply immediately."""
+    # Force frame re-evaluation to apply the change
+    scene = context.scene
+    current_frame = scene.frame_current
+    scene.frame_set(current_frame)
+    
+    for area in context.screen.areas:
+        if area.type == 'VIEW_3D':
+            area.tag_redraw()
+
+
 class WorldOnionSettings(bpy.types.PropertyGroup):
     enabled: bpy.props.BoolProperty(
         name="Enable",
@@ -169,24 +181,11 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         update=update_setting,
     )
     
-    anchor_snap_to_stroke: bpy.props.BoolProperty(
-        name="Snap to Stroke",
-        description="Recalculate anchor to stroke bottom when drawing. If disabled, anchor stays at original cursor position",
-        default=True,
-        update=update_setting,
-    )
-
     anchor_show_indicators: bpy.props.BoolProperty(
         name="Show Indicators",
         description="Show visual indicators at anchor positions",
         default=True,
         update=update_setting,
-    )
-    
-    world_lock_inherit: bpy.props.BoolProperty(
-        name="Inherit Lock",
-        description="New keyframes automatically inherit world lock from previous keyframe",
-        default=True,
     )
 
     # Motion path properties (simplified/native fallback)
@@ -233,5 +232,15 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         name="Shrinkwrap",
         description="Motion path and strokes automatically follow mesh surfaces below them",
         default=False,
-        update=update_setting,
+        update=update_realtime,
+    )
+
+    # Global Z offset for stroke placement
+    stroke_z_offset: bpy.props.FloatProperty(
+        name="Z Offset",
+        description="Push strokes up on global Z to prevent clipping behind mesh",
+        default=0.0, min=0.0, max=10.0,
+        step=1,  # 0.01 increments
+        precision=3,
+        update=update_realtime,
     )

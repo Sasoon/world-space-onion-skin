@@ -183,8 +183,9 @@ class WONION_PT_animation(bpy.types.Panel):
 
         layout.separator()
 
-        # Shrinkwrap
+        # Shrinkwrap and Z Offset
         layout.prop(settings, "depth_interaction_enabled")
+        layout.prop(settings, "stroke_z_offset")
 
         layout.separator()
 
@@ -194,9 +195,7 @@ class WONION_PT_animation(bpy.types.Panel):
         if settings.anchor_enabled:
             box = layout.box()
             box.prop(settings, "anchor_auto_cursor")
-            box.prop(settings, "anchor_snap_to_stroke")
             box.prop(settings, "anchor_show_indicators")
-            box.prop(settings, "world_lock_inherit")
 
         layout.separator()
 

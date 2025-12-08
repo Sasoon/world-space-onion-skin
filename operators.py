@@ -239,6 +239,7 @@ class WONION_OT_snap_to_gp(bpy.types.Operator):
             return {'CANCELLED'}
             
         scene = context.scene
+        settings = scene.world_onion
         current_frame = scene.frame_current
         
         # Calculate stroke bottom-center (center XY, lowest Z)
@@ -247,6 +248,10 @@ class WONION_OT_snap_to_gp(bpy.types.Operator):
         if anchor_pos is None:
             self.report({'WARNING'}, "No strokes found")
             return {'CANCELLED'}
+        
+        # Apply global Z offset
+        anchor_pos = anchor_pos.copy()
+        anchor_pos.z += settings.stroke_z_offset
         
         result = set_anchor_logic(context, gp_obj, scene, anchor_pos, move_selected_strokes_to_target=False)
         
@@ -276,7 +281,11 @@ class WONION_OT_snap_to_cursor(bpy.types.Operator):
             return {'CANCELLED'}
         
         scene = context.scene
+        settings = scene.world_onion
         cursor_pos = scene.cursor.location.copy()
+        
+        # Apply global Z offset
+        cursor_pos.z += settings.stroke_z_offset
         
         result = set_anchor_logic(context, gp_obj, scene, cursor_pos, move_selected_strokes_to_target=True)
         

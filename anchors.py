@@ -147,10 +147,12 @@ def migrate_anchor_data(gp_obj, layer_name, old_frame, new_frame):
 
 
 def calculate_anchor_from_strokes(gp_obj, layer, frame_number, return_local=False):
-    """Calculate anchor position from strokes: center XY, lowest Z.
+    """Calculate anchor position from strokes: center XY, lowest Z in WORLD space.
 
-    IMPORTANT: Computes anchor from RAW local stroke positions first,
-    then transforms to world.
+    Transforms all points to world space first, then computes:
+    - X: average of all world X coordinates
+    - Y: average of all world Y coordinates
+    - Z: minimum of all world Z coordinates (so strokes sit ON surfaces)
 
     Args:
         gp_obj: The GP object
@@ -184,30 +186,33 @@ def calculate_anchor_from_strokes(gp_obj, layer, frame_number, return_local=Fals
     if len(pos_attr.data) == 0:
         return (None, None) if return_local else None
 
-    # Compute anchor in LOCAL coordinates first
-    local_min_z = float('inf')
-    local_sum_x = 0.0
-    local_sum_y = 0.0
+    # Get world matrix for transforming local to world
+    matrix_world = gp_obj.matrix_world
+
+    # Compute anchor in WORLD coordinates (center XY, lowest Z)
+    world_min_z = float('inf')
+    world_sum_x = 0.0
+    world_sum_y = 0.0
     count = 0
 
     for p in pos_attr.data:
         local_pos = Vector(p.vector)
-        local_sum_x += local_pos.x
-        local_sum_y += local_pos.y
-        if local_pos.z < local_min_z:
-            local_min_z = local_pos.z
+        world_pos = matrix_world @ local_pos
+        world_sum_x += world_pos.x
+        world_sum_y += world_pos.y
+        if world_pos.z < world_min_z:
+            world_min_z = world_pos.z
         count += 1
 
     if count == 0:
         return (None, None) if return_local else None
 
-    # Anchor in local coordinates
-    anchor_local = Vector((local_sum_x / count, local_sum_y / count, local_min_z))
-
-    # Transform anchor_local to world coordinates using CURRENT matrix_world.
-    anchor_world = gp_obj.matrix_world @ anchor_local
+    # Anchor in world coordinates
+    anchor_world = Vector((world_sum_x / count, world_sum_y / count, world_min_z))
 
     if return_local:
+        # Transform back to local if needed
+        anchor_local = gp_obj.matrix_world.inverted() @ anchor_world
         return anchor_world, anchor_local
     return anchor_world
 

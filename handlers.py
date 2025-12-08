@@ -81,6 +81,11 @@ def on_frame_change(scene):
     if settings.depth_interaction_enabled:
         adjust_obj_to_surface(gp_obj, scene)
 
+    # === Z OFFSET ===
+    # Apply global Z offset to push strokes above mesh
+    if settings.stroke_z_offset > 0:
+        gp_obj.location.z += settings.stroke_z_offset
+
     # === ANCHOR SYSTEM ===
     if settings.anchor_enabled:
         # Update keyframe tracking set on frame change
