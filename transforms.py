@@ -196,7 +196,11 @@ def adjust_obj_to_surface(gp_obj, scene):
         new_z = location.z + SURFACE_OFFSET
         # Only update if significant change to avoid float jitter fighting F-Curve
         if abs(new_z - current_pos.z) > 0.0001:
-            gp_obj.location.z = new_z
-            return True
-            
+            try:
+                gp_obj.location.z = new_z
+                return True
+            except AttributeError:
+                # Writing not allowed in this context (render, playback, etc.)
+                return False
+
     return False

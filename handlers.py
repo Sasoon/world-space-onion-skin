@@ -84,13 +84,20 @@ def on_frame_change(scene):
     # === Z OFFSET ===
     # Apply global Z offset to push strokes above mesh
     if settings.stroke_z_offset > 0:
-        gp_obj.location.z += settings.stroke_z_offset
+        try:
+            gp_obj.location.z += settings.stroke_z_offset
+        except AttributeError:
+            # Writing not allowed in this context (render, playback, etc.)
+            pass
 
     # === FORCE DEPSGRAPH UPDATE ===
     # After shrinkwrap/Z-offset modifies location, force matrix_world recalculation
     # so cache captures the correct world-space positions
     if settings.depth_interaction_enabled or settings.stroke_z_offset > 0:
-        bpy.context.view_layer.update()
+        try:
+            bpy.context.view_layer.update()
+        except (RuntimeError, AttributeError):
+            pass
 
     # === ANCHOR SYSTEM ===
     if settings.anchor_enabled:
