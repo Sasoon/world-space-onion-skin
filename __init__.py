@@ -63,6 +63,9 @@ classes = (
 @persistent
 def on_load_post(dummy):
     """Called after a .blend file is loaded. Re-register draw handlers if addon is enabled."""
+    # v8.1: Always re-register driver namespace on file load (drivers persist but namespace doesn't)
+    drawing.register_driver_namespace()
+
     # Check if any scene has the addon enabled
     for scene in bpy.data.scenes:
         if hasattr(scene, 'world_onion') and scene.world_onion.enabled:

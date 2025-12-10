@@ -138,14 +138,14 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
     frames_before: bpy.props.IntProperty(
         name="Before",
         description="Number of frames/keyframes to show before current",
-        default=3, min=0, max=50,
+        default=3, min=0, max=500,
         update=update_setting,
     )
-    
+
     frames_after: bpy.props.IntProperty(
-        name="After", 
+        name="After",
         description="Number of frames/keyframes to show after current",
-        default=3, min=0, max=50,
+        default=3, min=0, max=500,
         update=update_setting,
     )
     

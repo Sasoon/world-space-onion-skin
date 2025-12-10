@@ -146,18 +146,6 @@ class WONION_PT_animation(bpy.types.Panel):
         settings = context.scene.world_onion
         gp_obj = get_active_gp(context)
 
-        # Snap buttons at the top, same row (Cursor first, then GP)
-        row = layout.row(align=True)
-        row.operator("world_onion.snap_to_cursor", text="Snap to Cursor", icon='CURSOR')
-        row.operator("world_onion.snap_to_gp", text="Snap to GP", icon='GREASEPENCIL')
-
-        # Align to View toggle and button
-        row = layout.row(align=True)
-        row.prop(settings, "align_to_view", toggle=True, icon='VIEW_CAMERA')
-        row.operator("world_onion.align_to_view", text="", icon='CON_TRACKTO')
-
-        layout.separator()
-
         # Motion Path
         row = layout.row(align=True)
         row.prop(settings, "motion_path_enabled")
@@ -166,7 +154,6 @@ class WONION_PT_animation(bpy.types.Panel):
             row.prop(settings, "motion_path_width", text="W")
 
             row = layout.row(align=True)
-            row.prop(settings, "motion_path_show_points")
             row.prop(settings, "motion_path_smoothing")
 
         layout.separator()
