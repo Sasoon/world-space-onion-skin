@@ -9,6 +9,7 @@ from .drawing import (
     register_draw_handlers, unregister_draw_handlers,
     bake_shrinkwrap_offsets, invalidate_baked_offsets,
     invalidate_motion_path, remove_shrinkwrap_driver,
+    invalidate_onion_batch_cache,
 )
 from .anchors import get_current_keyframes_set
 from .handlers import set_last_keyframe_set, set_last_active_layer_name
@@ -70,8 +71,13 @@ def update_anchor_enabled(self, context):
 
 def update_realtime(self, context):
     """Called when realtime settings change (Z offset, shrinkwrap) - apply immediately."""
-    # Clear stale cached data so strokes are recalculated with new settings
-    clear_cache()
+    # NOTE: DO NOT clear stroke cache here!
+    # Z offset is applied at draw time, not stored in cache.
+    # Clearing cache on every slider adjustment was causing massive lag.
+    # Only shrinkwrap state change requires special handling (baking).
+
+    # Invalidate GPU batch cache since z_offset affects batch geometry
+    invalidate_onion_batch_cache()
 
     # Auto-bake shrinkwrap offsets when shrinkwrap is enabled
     # This ensures we have baked data before playback starts

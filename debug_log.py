@@ -9,7 +9,7 @@ from datetime import datetime
 
 # Log file path (same directory as this module)
 _LOG_FILE = os.path.join(os.path.dirname(__file__), "debug.log")
-_ENABLED = True  # Set to False to disable logging
+_ENABLED = False  # DISABLED for performance - logging causes disk I/O in draw loop!
 _MAX_LINES = 500  # Keep last N lines to prevent huge files
 
 def _get_timestamp():

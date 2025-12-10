@@ -47,9 +47,15 @@ def get_cache():
 
 
 def clear_cache():
-    """Clear all cached frames."""
+    """Clear all cached frames and invalidate GPU batch cache."""
     global _cache
     _cache = {}
+    # Also invalidate onion batch cache since stroke data changed
+    try:
+        from .drawing import invalidate_onion_batch_cache
+        invalidate_onion_batch_cache()
+    except ImportError:
+        pass  # drawing module not loaded yet
 
 
 def get_cache_stats():
@@ -124,12 +130,13 @@ def extract_strokes_at_current_frame(gp_obj, settings):
             if start_idx >= end_idx:
                 continue
 
-            # Extract world points
+            # Extract world points as tuples (not Vectors) for GPU efficiency
+            # This eliminates tuple conversion overhead during every viewport redraw
             world_points = []
             for p_idx in range(start_idx, end_idx):
                 local_pos = Vector(pos_attr.data[p_idx].vector)
                 world_pos = full_matrix @ local_pos
-                world_points.append(world_pos.copy())
+                world_points.append((world_pos.x, world_pos.y, world_pos.z))
 
             if len(world_points) >= 2:
                 # Check material fill setting (not geometric closure)

@@ -101,12 +101,13 @@ class WONION_OT_cursor_sync(bpy.types.Operator):
             return {'CANCELLED'}
 
         wm = context.window_manager
-        # v8.5.1: Increased polling rate to 200fps (5ms) to reduce cursor lag during scrubbing
-        # Higher frequency = less time between frame change and cursor update
-        self._timer = wm.event_timer_add(0.005, window=context.window)
+        # v9: Reduced polling rate to 60fps (16ms) for better performance
+        # 60Hz matches typical display refresh and reduces CPU overhead significantly
+        # The handler also catches cursor updates, so this frequency is sufficient
+        self._timer = wm.event_timer_add(0.016, window=context.window)
         wm.modal_handler_add(self)
         _cursor_sync_running = True
-        log("Cursor sync modal started (5ms interval)", "INFO")
+        log("Cursor sync modal started (16ms interval)", "INFO")
         return {'RUNNING_MODAL'}
 
     def cancel(self, context):

@@ -2,6 +2,8 @@
 GPU drawing callbacks for onion skin and anchor visualization.
 """
 
+import bisect
+
 import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
@@ -19,14 +21,30 @@ _anchor_draw_handler = None
 _motion_path_handler = None
 
 # Motion path cache
-_motion_path_cache = None  # List of (x, y, z) tuples
+_motion_path_cache = None  # List of Vector positions
 _motion_path_cache_gp = None  # GP object the cache is for
 _motion_path_dirty = True
+# Motion path GPU batch cache (avoids recreation every redraw)
+_motion_path_coords = None  # Pre-built tuple coords for GPU
+_motion_path_line_batch = None
+_motion_path_point_batch = None
 
 # Baked shrinkwrap offsets - computed ONCE when shrinkwrap enabled or animation changes
 # Structure: {frame: z_offset}  - stores the Z offset from raycast
 _baked_shrinkwrap_offsets = {}
 _baked_offset_valid = False  # True after successful bake
+
+# Onion skin GPU batch cache - CRITICAL for performance near camera
+# Structure: {frame: {'fill_batches': [batch, ...], 'stroke_batches': [batch, ...]}}
+# Batches are keyed by frame and built once, reused on every redraw
+_onion_batch_cache = {}
+_onion_cache_z_offset = None  # Track z_offset to detect changes
+_onion_cache_gp = None  # Track GP object to detect changes
+
+# Keyframe list cache - avoid recomputing sorted keyframes on every draw
+# Invalidated when GP object changes or onion batch cache is cleared
+_keyframe_cache = None  # Sorted list of keyframe numbers
+_keyframe_cache_gp = None  # GP object the cache is for
 
 # v8.5: Timer code removed - now using modal operator in operators.py
 
@@ -53,8 +71,24 @@ def _get_fill_shader():
 
 def invalidate_motion_path():
     """Mark motion path cache as dirty, triggering rebuild on next draw."""
-    global _motion_path_dirty
+    global _motion_path_dirty, _motion_path_line_batch, _motion_path_point_batch, _motion_path_coords
     _motion_path_dirty = True
+    # Also invalidate GPU batch cache
+    _motion_path_line_batch = None
+    _motion_path_point_batch = None
+    _motion_path_coords = None
+
+
+def invalidate_onion_batch_cache():
+    """Clear all cached onion skin GPU batches. Call when stroke data changes."""
+    global _onion_batch_cache, _onion_cache_z_offset, _onion_cache_gp
+    global _keyframe_cache, _keyframe_cache_gp
+    _onion_batch_cache = {}
+    _onion_cache_z_offset = None
+    _onion_cache_gp = None
+    # Also clear keyframe cache since keyframes may have changed
+    _keyframe_cache = None
+    _keyframe_cache_gp = None
 
 
 def invalidate_baked_offsets():
@@ -315,11 +349,48 @@ def get_draw_handlers():
     return _draw_handler, _anchor_draw_handler
 
 
+def _build_onion_batches_for_frame(frame, strokes, z_offset, fill_shader, stroke_shader):
+    """
+    Build and cache GPU batches for a single onion skin frame.
+    Returns dict with 'fill_batches' and 'stroke_batches' lists.
+    """
+    fill_batches = []
+    stroke_batches = []
+
+    for stroke_data in strokes:
+        points = stroke_data['points']
+        if len(points) < 2:
+            continue
+
+        # Apply z_offset to points (points are tuples)
+        coords = [(p[0], p[1], p[2] + z_offset) for p in points]
+
+        # Build fill batch if has fill triangles
+        fill_triangles = stroke_data.get('fill_triangles', [])
+        if fill_triangles:
+            tri_coords = []
+            for i, j, k in fill_triangles:
+                if i < len(coords) and j < len(coords) and k < len(coords):
+                    tri_coords.extend([coords[i], coords[j], coords[k]])
+            if tri_coords:
+                fill_batches.append(batch_for_shader(fill_shader, 'TRIS', {"pos": tri_coords}))
+
+        # Build stroke batch
+        stroke_batches.append(batch_for_shader(stroke_shader, 'LINE_STRIP', {"pos": coords}))
+
+    return {'fill_batches': fill_batches, 'stroke_batches': stroke_batches}
+
+
 def draw_onion_callback():
     """
     GPU draw callback - renders cached onion skin strokes.
     Called every viewport redraw.
+
+    PERFORMANCE: Uses batch caching to avoid recreating GPU geometry every frame.
+    Batches are cached per (frame, z_offset) and only rebuilt when data changes.
     """
+    global _onion_batch_cache, _onion_cache_z_offset, _onion_cache_gp
+
     try:
         scene = bpy.context.scene
     except (RuntimeError, AttributeError):
@@ -328,9 +399,9 @@ def draw_onion_callback():
 
     if not hasattr(scene, 'world_onion'):
         return
-    
+
     settings = scene.world_onion
-    
+
     if not settings.enabled:
         return
 
@@ -340,19 +411,31 @@ def draw_onion_callback():
         return
 
     current_frame = scene.frame_current
-
     cache = get_cache()
-    
+
     # Determine which frames to show based on mode
     if settings.mode == 'KEYFRAMES':
         frames_to_show = get_keyframe_based_frames(gp_obj, settings, current_frame)
     else:
         frames_to_show = get_regular_frames(settings, current_frame)
-    
+
     if not frames_to_show:
         return
 
-    # Set up GPU state (use cached shaders for performance)
+    # Check if GP object changed -> invalidate batch cache
+    if _onion_cache_gp != gp_obj:
+        _onion_batch_cache = {}
+        _onion_cache_gp = gp_obj
+
+    # Calculate base z_offset (stroke_z_offset setting)
+    base_z_offset = settings.stroke_z_offset if settings.stroke_z_offset > 0 else 0.0
+
+    # Check if z_offset settings changed -> invalidate batch cache
+    if _onion_cache_z_offset != base_z_offset:
+        _onion_batch_cache = {}
+        _onion_cache_z_offset = base_z_offset
+
+    # Set up GPU state
     stroke_shader = _get_stroke_shader()
     fill_shader = _get_fill_shader()
 
@@ -361,13 +444,7 @@ def draw_onion_callback():
     gpu.state.depth_mask_set(False)
 
     try:
-        # Get viewport dimensions for line width
         region = bpy.context.region
-
-        # Bind shaders once for the entire draw operation
-        stroke_shader.bind()
-        stroke_shader.uniform_float("viewportSize", (region.width, region.height))
-        stroke_shader.uniform_float("lineWidth", settings.line_width)
 
         # Draw each cached frame
         for frame_offset, frame in frames_to_show:
@@ -380,14 +457,24 @@ def draw_onion_callback():
             if not strokes:
                 continue
 
-            # v7.2: Apply baked offset for THIS onion skin frame
-            z_offset = 0.0
+            # Calculate z_offset for this frame (includes per-frame baked offset)
+            z_offset = base_z_offset
             if settings.depth_interaction_enabled and is_bake_valid():
                 baked_offset = get_baked_offset(frame)
                 if baked_offset is not None:
-                    z_offset = baked_offset
-            if settings.stroke_z_offset > 0:
-                z_offset += settings.stroke_z_offset
+                    z_offset += baked_offset
+
+            # Cache key includes frame and z_offset (rounded to avoid float precision issues)
+            cache_key = (frame, round(z_offset, 4))
+
+            # Check if batches are cached for this frame
+            if cache_key not in _onion_batch_cache:
+                # Build and cache batches
+                _onion_batch_cache[cache_key] = _build_onion_batches_for_frame(
+                    frame, strokes, z_offset, fill_shader, stroke_shader
+                )
+
+            cached_batches = _onion_batch_cache[cache_key]
 
             # DEBUG: Log onion draw
             log_onion_draw(current_frame, frame, z_offset, len(strokes))
@@ -401,58 +488,26 @@ def draw_onion_callback():
             # Calculate opacity with falloff
             abs_offset = abs(frame_offset)
             max_offset = max(settings.frames_before, settings.frames_after, 1)
+            falloff_factor = 1.0 - (abs_offset / max_offset) * settings.falloff if settings.falloff > 0 else 1.0
 
-            if settings.falloff > 0:
-                falloff_factor = 1.0 - (abs_offset / max_offset) * settings.falloff
-            else:
-                falloff_factor = 1.0
-
-            # Fill uses fill_opacity setting
+            # PASS 1: Draw fills (set color, draw all cached fill batches)
             fill_alpha = settings.fill_opacity * max(0.1, falloff_factor)
             fill_color = (base_color[0], base_color[1], base_color[2], fill_alpha)
 
-            # Stroke uses opacity setting
+            fill_shader.bind()
+            fill_shader.uniform_float("color", fill_color)
+            for batch in cached_batches['fill_batches']:
+                batch.draw(fill_shader)
+
+            # PASS 2: Draw strokes (set color, draw all cached stroke batches)
             stroke_alpha = settings.opacity * max(0.1, falloff_factor)
             stroke_color = (base_color[0], base_color[1], base_color[2], stroke_alpha)
 
-            # PASS 1: Draw fills first (underneath strokes)
-            # Bind fill shader once per frame with current color
-            fill_shader.bind()
-            fill_shader.uniform_float("color", fill_color)
-
-            for stroke_data in strokes:
-                fill_triangles = stroke_data.get('fill_triangles', [])
-                if fill_triangles:
-                    points = stroke_data['points']
-                    # v7.2: Apply z_offset to world points
-                    coords = [(p.x, p.y, p.z + z_offset) for p in points]
-
-                    # Build triangle vertex list from indices
-                    tri_coords = []
-                    for i, j, k in fill_triangles:
-                        if i < len(coords) and j < len(coords) and k < len(coords):
-                            tri_coords.extend([coords[i], coords[j], coords[k]])
-
-                    if tri_coords:
-                        batch = batch_for_shader(fill_shader, 'TRIS', {"pos": tri_coords})
-                        batch.draw(fill_shader)
-
-            # PASS 2: Draw strokes on top
-            # Re-bind stroke shader with current color (viewport/lineWidth already set)
             stroke_shader.bind()
             stroke_shader.uniform_float("viewportSize", (region.width, region.height))
             stroke_shader.uniform_float("lineWidth", settings.line_width)
             stroke_shader.uniform_float("color", stroke_color)
-
-            for stroke_data in strokes:
-                points = stroke_data['points']
-                # v7.2: Apply z_offset to world points
-                coords = [(p.x, p.y, p.z + z_offset) for p in points]
-
-                if len(coords) < 2:
-                    continue
-
-                batch = batch_for_shader(stroke_shader, 'LINE_STRIP', {"pos": coords})
+            for batch in cached_batches['stroke_batches']:
                 batch.draw(stroke_shader)
 
     finally:
@@ -463,51 +518,57 @@ def draw_onion_callback():
 
 
 def get_keyframe_based_frames(gp_obj, settings, current_frame):
-    """Get frames to show in GP Keyframes mode."""
+    """
+    Get frames to show in GP Keyframes mode.
+
+    PERFORMANCE: Uses cached sorted keyframe list to avoid iterating all
+    layers/keyframes on every viewport draw.
+    """
+    global _keyframe_cache, _keyframe_cache_gp
+
     frames_to_show = []
 
     if gp_obj is None:
         return frames_to_show
 
-    # Collect all unique keyframe numbers
-    all_keyframes = set()
-    for layer in gp_obj.data.layers:
-        if layer.hide:
-            continue
-        
-        for kf in layer.frames:
-            all_keyframes.add(kf.frame_number)
-    
-    sorted_keyframes = sorted(all_keyframes)
-    
+    # Check if we need to rebuild the keyframe cache
+    if _keyframe_cache is None or _keyframe_cache_gp != gp_obj:
+        # Collect all unique keyframe numbers (expensive - only do once)
+        all_keyframes = set()
+        for layer in gp_obj.data.layers:
+            if layer.hide:
+                continue
+            for kf in layer.frames:
+                all_keyframes.add(kf.frame_number)
+
+        _keyframe_cache = sorted(all_keyframes)
+        _keyframe_cache_gp = gp_obj
+
+    sorted_keyframes = _keyframe_cache
+
     if not sorted_keyframes:
         return frames_to_show
-    
-    # Find current keyframe index
-    current_idx = None
-    for i, kf in enumerate(sorted_keyframes):
-        if kf == current_frame:
-            current_idx = i
-            break
-        elif kf > current_frame:
-            current_idx = i - 1 if i > 0 else 0
-            break
-    
-    if current_idx is None:
+
+    # Find current keyframe index using binary search (O(log n) instead of O(n))
+    idx = bisect.bisect_right(sorted_keyframes, current_frame)
+    current_idx = idx - 1 if idx > 0 else 0
+
+    # Clamp to valid range
+    if current_idx >= len(sorted_keyframes):
         current_idx = len(sorted_keyframes) - 1
-    
+
     # Get keyframes before
     for i in range(1, settings.frames_before + 1):
         idx = current_idx - i
         if idx >= 0:
             frames_to_show.append((-i, sorted_keyframes[idx]))
-    
+
     # Get keyframes after
     for i in range(1, settings.frames_after + 1):
         idx = current_idx + i
         if idx < len(sorted_keyframes):
             frames_to_show.append((i, sorted_keyframes[idx]))
-    
+
     return frames_to_show
 
 
@@ -612,6 +673,7 @@ def draw_motion_path_callback():
     Respects depth interaction (shrinkwrap) if enabled.
     """
     global _motion_path_cache, _motion_path_cache_gp, _motion_path_dirty
+    global _motion_path_coords, _motion_path_line_batch, _motion_path_point_batch
 
     try:
         scene = bpy.context.scene
@@ -705,8 +767,21 @@ def draw_motion_path_callback():
         _motion_path_cache_gp = gp_obj
         _motion_path_dirty = False
 
+        # Build GPU batches once and cache them
+        _motion_path_coords = [(p.x, p.y, p.z) for p in points]
+        _motion_path_line_batch = batch_for_shader(
+            _get_stroke_shader(), 'LINE_STRIP', {"pos": _motion_path_coords}
+        )
+        _motion_path_point_batch = batch_for_shader(
+            _get_fill_shader(), 'POINTS', {"pos": _motion_path_coords}
+        )
+
     path_points = _motion_path_cache
     if not path_points or len(path_points) < 2:
+        return
+
+    # Check if batches are available
+    if _motion_path_line_batch is None:
         return
 
     # Set up GPU state
@@ -723,21 +798,16 @@ def draw_motion_path_callback():
     line_shader.uniform_float("lineWidth", settings.motion_path_width)
     line_shader.uniform_float("color", color)
 
-    # Draw path
-    # Convert Vectors to tuples for batch
-    coords = [(p.x, p.y, p.z) for p in path_points]
-    
-    batch = batch_for_shader(line_shader, 'LINE_STRIP', {"pos": coords})
-    batch.draw(line_shader)
+    # Draw path using cached batch (no recreation every frame!)
+    _motion_path_line_batch.draw(line_shader)
 
-    # Draw points
+    # Draw points using cached batch
     if settings.motion_path_show_points:
         point_shader = _get_fill_shader()
         point_shader.bind()
         gpu.state.point_size_set(8.0)
         point_shader.uniform_float("color", color)
-        batch = batch_for_shader(point_shader, 'POINTS', {"pos": coords})
-        batch.draw(point_shader)
+        _motion_path_point_batch.draw(point_shader)
 
     # Reset GPU state
     gpu.state.blend_set('NONE')

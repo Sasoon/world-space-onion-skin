@@ -112,8 +112,10 @@ def on_frame_change(scene):
                     pass  # Context unavailable
 
     # === MOTION PATH ===
-    if settings.motion_path_enabled:
-        invalidate_motion_path()
+    # NOTE: Motion path invalidation REMOVED from frame change handler.
+    # The path only needs rebuilding when animation data changes (handled in
+    # on_depsgraph_update) or shrinkwrap settings change (handled in settings.py).
+    # Invalidating on every frame was causing massive performance overhead.
 
     # Request viewport redraw
     try:
