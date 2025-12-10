@@ -149,32 +149,51 @@ def _setup_shrinkwrap_driver(gp_obj):
     The driver expression 'shrinkwrap_offset(frame)' calls our registered
     function which looks up the offset from our baked dict.
     """
-    # Remove existing driver if present (avoid duplicates)
+    def _do_setup():
+        """Inner function to do the actual driver setup."""
+        # Remove existing driver if present (avoid duplicates)
+        try:
+            gp_obj.driver_remove("delta_location", 2)  # index 2 = Z
+        except:
+            pass  # No driver existed
+
+        # Ensure namespace function is registered
+        register_driver_namespace()
+
+        # Add new driver
+        fcurve = gp_obj.driver_add("delta_location", 2)
+        driver = fcurve.driver
+        driver.type = 'SCRIPTED'
+
+        # Add frame variable that reads current frame from scene
+        var = driver.variables.new()
+        var.name = "frame"
+        var.type = 'SINGLE_PROP'
+        var.targets[0].id_type = 'SCENE'
+        var.targets[0].id = bpy.context.scene
+        var.targets[0].data_path = "frame_current"
+
+        # Expression calls our registered namespace function
+        driver.expression = "shrinkwrap_offset(frame)"
+
+        log("Setup driver on delta_location.z using namespace function", "BAKE")
+
+    # Try direct setup first
     try:
-        gp_obj.driver_remove("delta_location", 2)  # index 2 = Z
-    except:
-        pass  # No driver existed
-
-    # Ensure namespace function is registered
-    register_driver_namespace()
-
-    # Add new driver
-    fcurve = gp_obj.driver_add("delta_location", 2)
-    driver = fcurve.driver
-    driver.type = 'SCRIPTED'
-
-    # Add frame variable that reads current frame from scene
-    var = driver.variables.new()
-    var.name = "frame"
-    var.type = 'SINGLE_PROP'
-    var.targets[0].id_type = 'SCENE'
-    var.targets[0].id = bpy.context.scene
-    var.targets[0].data_path = "frame_current"
-
-    # Expression calls our registered namespace function
-    driver.expression = "shrinkwrap_offset(frame)"
-
-    log("Setup driver on delta_location.z using namespace function", "BAKE")
+        _do_setup()
+    except AttributeError as e:
+        if "Writing to ID classes" in str(e):
+            # Context doesn't allow ID modifications - defer to timer
+            log("Driver setup deferred to timer (context restriction)", "BAKE")
+            def _deferred_setup():
+                try:
+                    _do_setup()
+                except Exception as ex:
+                    log(f"Deferred driver setup failed: {ex}", "ERROR")
+                return None  # Don't repeat
+            bpy.app.timers.register(_deferred_setup, first_interval=0.1)
+        else:
+            raise  # Re-raise unexpected errors
 
 
 def remove_shrinkwrap_driver(gp_obj):
@@ -768,12 +787,40 @@ def draw_motion_path_callback():
         _motion_path_dirty = False
 
         # Build GPU batches once and cache them
-        _motion_path_coords = [(p.x, p.y, p.z) for p in points]
+        coords = [(p.x, p.y, p.z) for p in points]
+
+        # Apply Catmull-Rom smoothing if enabled
+        if settings.motion_path_smoothing > 0 and len(coords) >= 4:
+            smoothed = []
+            subdivisions = settings.motion_path_smoothing
+
+            for i in range(len(coords) - 1):
+                # Get 4 control points (clamp at boundaries)
+                p0 = coords[max(0, i - 1)]
+                p1 = coords[i]
+                p2 = coords[min(len(coords) - 1, i + 1)]
+                p3 = coords[min(len(coords) - 1, i + 2)]
+
+                # Add start point
+                smoothed.append(p1)
+
+                # Add interpolated points between p1 and p2
+                for j in range(1, subdivisions + 1):
+                    t = j / (subdivisions + 1)
+                    pt = catmull_rom_point(p0, p1, p2, p3, t)
+                    smoothed.append((pt.x, pt.y, pt.z))
+
+            # Add final point
+            smoothed.append(coords[-1])
+            coords = smoothed
+
+        _motion_path_coords = coords
         _motion_path_line_batch = batch_for_shader(
             _get_stroke_shader(), 'LINE_STRIP', {"pos": _motion_path_coords}
         )
+        # Points batch uses original unsmoothed positions for keyframe markers
         _motion_path_point_batch = batch_for_shader(
-            _get_fill_shader(), 'POINTS', {"pos": _motion_path_coords}
+            _get_fill_shader(), 'POINTS', {"pos": [(p.x, p.y, p.z) for p in points]}
         )
 
     path_points = _motion_path_cache

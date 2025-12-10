@@ -58,6 +58,11 @@ class WONION_PT_main_panel(bpy.types.Panel):
             row.operator("world_onion.snap_to_cursor", text="Snap to Cursor", icon='CURSOR')
             row.operator("world_onion.snap_to_gp", text="Snap to GP", icon='GREASEPENCIL')
 
+            # Align to View toggle and button
+            row = layout.row(align=True)
+            row.prop(settings, "align_to_view", toggle=True, icon='VIEW_CAMERA')
+            row.operator("world_onion.align_to_view", text="", icon='CON_TRACKTO')
+
 
 class WONION_PT_frames(bpy.types.Panel):
     """Frame settings sub-panel"""
@@ -146,6 +151,11 @@ class WONION_PT_animation(bpy.types.Panel):
         row.operator("world_onion.snap_to_cursor", text="Snap to Cursor", icon='CURSOR')
         row.operator("world_onion.snap_to_gp", text="Snap to GP", icon='GREASEPENCIL')
 
+        # Align to View toggle and button
+        row = layout.row(align=True)
+        row.prop(settings, "align_to_view", toggle=True, icon='VIEW_CAMERA')
+        row.operator("world_onion.align_to_view", text="", icon='CON_TRACKTO')
+
         layout.separator()
 
         # Motion Path
@@ -154,9 +164,10 @@ class WONION_PT_animation(bpy.types.Panel):
         if settings.motion_path_enabled:
             row.prop(settings, "motion_path_color", text="")
             row.prop(settings, "motion_path_width", text="W")
-            
+
             row = layout.row(align=True)
             row.prop(settings, "motion_path_show_points")
+            row.prop(settings, "motion_path_smoothing")
 
         layout.separator()
 

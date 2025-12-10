@@ -169,6 +169,66 @@ def ensure_billboard_constraint(gp_obj, scene):
     return modified
 
 
+def align_strokes_to_camera(stroke_points, anchor_pos, scene):
+    """
+    Rotate stroke points around anchor to face the camera.
+
+    For 2.5D workflows, strokes should lie on a plane perpendicular to the
+    camera's view direction. This function rotates stroke points so they
+    face the camera, preserving their shape.
+
+    Args:
+        stroke_points: List of world-space Vector points
+        anchor_pos: Vector - center of rotation
+        scene: Blender scene (to get camera)
+
+    Returns:
+        List of rotated world-space Vector points
+    """
+    camera = scene.camera
+    if camera is None:
+        return stroke_points  # No camera, can't align
+
+    if len(stroke_points) < 3:
+        return stroke_points  # Need at least 3 points to determine plane
+
+    # 1. Get camera's forward direction (negative Z in camera space)
+    cam_matrix = camera.matrix_world
+    cam_forward = -(cam_matrix.to_3x3() @ Vector((0, 0, 1)))
+    cam_forward.normalize()
+
+    # Target normal = camera forward (strokes should face camera)
+    target_normal = cam_forward
+
+    # 2. Compute current stroke plane normal using cross product of edges
+    # Use first, middle, and last points to estimate plane
+    p0 = stroke_points[0]
+    p1 = stroke_points[len(stroke_points) // 2]
+    p2 = stroke_points[-1]
+
+    edge1 = p1 - p0
+    edge2 = p2 - p0
+    current_normal = edge1.cross(edge2)
+
+    if current_normal.length < 0.0001:
+        return stroke_points  # Degenerate (collinear points)
+
+    current_normal.normalize()
+
+    # 3. Calculate rotation from current normal to target normal
+    rotation = current_normal.rotation_difference(target_normal)
+
+    # 4. Rotate all points around anchor
+    aligned_points = []
+    for p in stroke_points:
+        # Translate to anchor origin, rotate, translate back
+        relative = p - anchor_pos
+        rotated = rotation @ relative
+        aligned_points.append(anchor_pos + rotated)
+
+    return aligned_points
+
+
 def adjust_obj_to_surface(gp_obj, scene):
     """
     Adjust GP object location to sit on mesh surface (raycast down).

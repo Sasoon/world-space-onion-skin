@@ -31,6 +31,18 @@ _in_depsgraph_handler = False  # Prevent recursive handler calls
 # The driver on delta_location.z handles offset automatically now!
 
 
+def _tag_viewport_redraw():
+    """Tag a single 3D viewport for redraw - early exit for efficiency."""
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+                    return  # Only need one tag - Blender redraws all viewports
+    except (RuntimeError, AttributeError):
+        pass
+
+
 def get_last_keyframe_set():
     return _last_keyframe_set
 
@@ -117,14 +129,8 @@ def on_frame_change(scene):
     # on_depsgraph_update) or shrinkwrap settings change (handled in settings.py).
     # Invalidating on every frame was causing massive performance overhead.
 
-    # Request viewport redraw
-    try:
-        for window in bpy.context.window_manager.windows:
-            for area in window.screen.areas:
-                if area.type == 'VIEW_3D':
-                    area.tag_redraw()
-    except (RuntimeError, AttributeError):
-        pass
+    # Request viewport redraw - use efficient helper with early exit
+    _tag_viewport_redraw()
 
 
 @persistent
@@ -178,34 +184,34 @@ def _on_depsgraph_update_impl(scene, depsgraph):
     gp_data_changed = False
     animation_changed = False
 
-    # Check updates
+    # Check updates - with early exit once both flags found
     for update in depsgraph.updates:
+        # Early exit optimization - stop iterating once we know both flags
+        if gp_data_changed and animation_changed:
+            break
+
         # GP stroke data changed
-        if update.id == gp_data:
-            gp_data_changed = True
-        if isinstance(update.id, bpy.types.GreasePencil) and update.id.name == gp_data.name:
-            gp_data_changed = True
-        
+        if not gp_data_changed:
+            if update.id == gp_data:
+                gp_data_changed = True
+            elif isinstance(update.id, bpy.types.GreasePencil) and update.id.name == gp_data.name:
+                gp_data_changed = True
+
         # Animation data changed (Location keyframes added/deleted/moved)
-        if gp_obj.animation_data and update.id == gp_obj.animation_data.action:
-            animation_changed = True
-        if isinstance(update.id, bpy.types.Action):
-            # Check if this action belongs to our GP object
-            if gp_obj.animation_data and gp_obj.animation_data.action:
-                if update.id.name == gp_obj.animation_data.action.name:
-                    animation_changed = True
+        if not animation_changed:
+            if gp_obj.animation_data and update.id == gp_obj.animation_data.action:
+                animation_changed = True
+            elif isinstance(update.id, bpy.types.Action):
+                # Check if this action belongs to our GP object
+                if gp_obj.animation_data and gp_obj.animation_data.action:
+                    if update.id.name == gp_obj.animation_data.action.name:
+                        animation_changed = True
 
     # Invalidate motion path on GP data OR animation change
     if gp_data_changed or animation_changed:
         invalidate_motion_path()
         # Force viewport redraw for immediate feedback
-        try:
-            for window in bpy.context.window_manager.windows:
-                for area in window.screen.areas:
-                    if area.type == 'VIEW_3D':
-                        area.tag_redraw()
-        except (RuntimeError, AttributeError):
-            pass
+        _tag_viewport_redraw()
 
     # Detect keyframe changes
     if gp_data_changed and _last_keyframe_set:

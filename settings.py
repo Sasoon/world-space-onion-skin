@@ -50,6 +50,16 @@ def update_setting(self, context):
             area.tag_redraw()
 
 
+def update_motion_path_setting(self, context):
+    """Called when motion path geometry settings change (smoothing)."""
+    # Invalidate motion path cache so it rebuilds with new smoothing
+    invalidate_motion_path()
+    # Redraw viewports
+    for area in context.screen.areas:
+        if area.type == 'VIEW_3D':
+            area.tag_redraw()
+
+
 def update_anchor_enabled(self, context):
     """Called when anchor system is enabled/disabled.
 
@@ -209,6 +219,12 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         update=update_setting,
     )
 
+    align_to_view: bpy.props.BoolProperty(
+        name="Align to View",
+        description="Rotate strokes to face the camera when snapping",
+        default=False,
+    )
+
     # Motion path properties
     motion_path_enabled: bpy.props.BoolProperty(
         name="Show Motion Path",
@@ -245,7 +261,7 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         name="Smoothing",
         description="Subdivisions for smooth curves (0=sharp, higher=smoother)",
         default=0, min=0, max=200,
-        update=update_setting,
+        update=update_motion_path_setting,
     )
 
     # Depth interaction (shrinkwrap) - strokes follow mesh surface

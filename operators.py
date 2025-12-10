@@ -16,7 +16,7 @@ from .anchors import (
     get_current_keyframes_set,
     get_visible_keyframe,
 )
-from .transforms import get_layer_transform, get_camera_direction, align_canvas_to_cursor, ensure_billboard_constraint
+from .transforms import get_layer_transform, get_camera_direction, align_canvas_to_cursor, ensure_billboard_constraint, align_strokes_to_camera
 from .drawing import invalidate_motion_path, get_baked_offset
 from .debug_log import log
 
@@ -224,16 +224,18 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
     ensure_billboard_constraint(gp_obj, scene)
     context.view_layer.update()
 
-    # Matrix before move
+    # Matrix before move - include layer transform for consistency with cache.py
     matrix_world_old = gp_obj.matrix_world.copy()
-    
-    # Store world positions
+    layer_matrix = get_layer_transform(active_layer)
+    full_matrix_old = matrix_world_old @ layer_matrix
+
+    # Store world positions (using full transform: object + layer)
     stroke_points = []
     drawing = active_kf.drawing
     for stroke in drawing.strokes:
         points = []
         for p in stroke.points:
-            world_pos = matrix_world_old @ Vector(p.position)
+            world_pos = full_matrix_old @ Vector(p.position)
             points.append(world_pos)
         stroke_points.append(points)
         
@@ -246,37 +248,72 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
     # Update view layer to get new matrix
     context.view_layer.update()
     matrix_world_new = gp_obj.matrix_world
-    matrix_world_new_inv = matrix_world_new.inverted()
-    
+    # Use full matrix (object + layer) for transforming back to local space
+    full_matrix_new = matrix_world_new @ layer_matrix
+    full_matrix_new_inv = full_matrix_new.inverted()
+
     # Transform strokes back to local space relative to new object position
-    for i, stroke in enumerate(drawing.strokes):
-        if move_selected_strokes_to_target and stroke.select:
-            # Calculate bottom-center anchor point (center XY, lowest Z)
-            # This ensures strokes sit ON the surface rather than clipping through
-            points_world = stroke_points[i]
-            if not points_world:
-                continue
-                
-            sum_x = sum(p.x for p in points_world)
-            sum_y = sum(p.y for p in points_world)
-            min_z = min(p.z for p in points_world)
-            n = len(points_world)
-            bottom_center = Vector((sum_x/n, sum_y/n, min_z))
-            
-            # We want bottom_center to be at target_world_pos
-            offset = target_world_pos - bottom_center
-            
-            # Apply offset to world points, then transform to new local
-            for j, p_world in enumerate(points_world):
-                new_world = p_world + offset
-                new_local = matrix_world_new_inv @ new_world
-                stroke.points[j].position = new_local
-                
+    if move_selected_strokes_to_target:
+        # GROUPED centering: collect all points from ALL selected strokes
+        all_selected_world_points = []
+        selected_stroke_indices = []
+
+        for i, stroke in enumerate(drawing.strokes):
+            if stroke.select:
+                selected_stroke_indices.append(i)
+                all_selected_world_points.extend(stroke_points[i])
+
+        if all_selected_world_points:
+            # Compute single bottom-center for the entire group (center XY, lowest Z)
+            sum_x = sum(p.x for p in all_selected_world_points)
+            sum_y = sum(p.y for p in all_selected_world_points)
+            min_z = min(p.z for p in all_selected_world_points)
+            n = len(all_selected_world_points)
+            group_bottom_center = Vector((sum_x / n, sum_y / n, min_z))
+
+            # Single offset applied to all selected strokes as a group
+            offset = target_world_pos - group_bottom_center
+
+            # Apply offset to selected strokes (and optionally align to view)
+            settings = scene.world_onion
+            for i in selected_stroke_indices:
+                # Apply offset to get new world positions
+                offset_points = [p_world + offset for p_world in stroke_points[i]]
+
+                # Optionally align strokes to face camera
+                if settings.align_to_view:
+                    offset_points = align_strokes_to_camera(offset_points, target_world_pos, scene)
+
+                # Transform to local and write
+                for j, new_world in enumerate(offset_points):
+                    new_local = full_matrix_new_inv @ new_world
+                    drawing.strokes[i].points[j].position = new_local
+
+            # Preserve world position for non-selected strokes
+            for i, stroke in enumerate(drawing.strokes):
+                if i not in selected_stroke_indices:
+                    for j, p_world in enumerate(stroke_points[i]):
+                        new_local = full_matrix_new_inv @ p_world
+                        stroke.points[j].position = new_local
         else:
-            # Preserve world position (compensate for object move)
-            points_world = stroke_points[i]
-            for j, p_world in enumerate(points_world):
-                new_local = matrix_world_new_inv @ p_world
+            # No selected strokes - preserve all world positions
+            for i, stroke in enumerate(drawing.strokes):
+                for j, p_world in enumerate(stroke_points[i]):
+                    new_local = full_matrix_new_inv @ p_world
+                    stroke.points[j].position = new_local
+    else:
+        # Preserve world position for ALL strokes (compensate for object move)
+        # Optionally align to view if enabled
+        settings = scene.world_onion
+        for i, stroke in enumerate(drawing.strokes):
+            world_points = stroke_points[i]
+
+            # Optionally align strokes to face camera
+            if settings.align_to_view:
+                world_points = align_strokes_to_camera(world_points, target_world_pos, scene)
+
+            for j, p_world in enumerate(world_points):
+                new_local = full_matrix_new_inv @ p_world
                 stroke.points[j].position = new_local
 
     # Explicitly invalidate motion path and request redraw
@@ -497,6 +534,106 @@ class WONION_OT_reload_addon(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class WONION_OT_align_to_view(bpy.types.Operator):
+    """Align strokes on active layer to face the camera"""
+    bl_idname = "world_onion.align_to_view"
+    bl_label = "Align to View"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        gp_obj = get_active_gp(context)
+        if gp_obj is None:
+            return False
+        # Need a camera in the scene
+        return context.scene.camera is not None
+
+    def execute(self, context):
+        gp_obj = get_active_gp(context)
+        if gp_obj is None:
+            return {'CANCELLED'}
+
+        scene = context.scene
+        active_layer = gp_obj.data.layers.active
+        if active_layer is None:
+            self.report({'WARNING'}, "No active layer")
+            return {'CANCELLED'}
+
+        current_frame = scene.frame_current
+
+        # Find active keyframe
+        active_kf = None
+        for kf in active_layer.frames:
+            if kf.frame_number == current_frame:
+                active_kf = kf
+                break
+
+        if active_kf is None:
+            # Find visible keyframe
+            visible_kf = get_visible_keyframe(active_layer, current_frame)
+            if visible_kf is None:
+                self.report({'WARNING'}, "No keyframe found")
+                return {'CANCELLED'}
+            active_kf = visible_kf
+
+        drawing = active_kf.drawing
+        if drawing is None or len(drawing.strokes) == 0:
+            self.report({'WARNING'}, "No strokes to align")
+            return {'CANCELLED'}
+
+        # Get transform matrices (object + layer)
+        matrix_world = gp_obj.matrix_world
+        layer_matrix = get_layer_transform(active_layer)
+        full_matrix = matrix_world @ layer_matrix
+        full_matrix_inv = full_matrix.inverted()
+
+        # Calculate anchor position (rotation center) - use stroke bottom-center
+        anchor_pos = calculate_anchor_from_strokes(gp_obj, active_layer, active_kf.frame_number)
+        if anchor_pos is None:
+            # Fallback to object location
+            anchor_pos = gp_obj.location.copy()
+
+        # Collect world positions for all strokes
+        all_world_points = []
+        stroke_point_counts = []
+        for stroke in drawing.strokes:
+            stroke_world_points = []
+            for p in stroke.points:
+                world_pos = full_matrix @ Vector(p.position)
+                stroke_world_points.append(world_pos)
+            all_world_points.append(stroke_world_points)
+            stroke_point_counts.append(len(stroke.points))
+
+        # Flatten all points for alignment (so all strokes rotate together as a group)
+        flat_points = []
+        for stroke_points in all_world_points:
+            flat_points.extend(stroke_points)
+
+        if len(flat_points) < 3:
+            self.report({'WARNING'}, "Need at least 3 points to align")
+            return {'CANCELLED'}
+
+        # Align all points as a group
+        aligned_flat = align_strokes_to_camera(flat_points, anchor_pos, scene)
+
+        # Unflatten and write back to strokes
+        idx = 0
+        for i, stroke in enumerate(drawing.strokes):
+            for j in range(stroke_point_counts[i]):
+                new_local = full_matrix_inv @ aligned_flat[idx]
+                stroke.points[j].position = new_local
+                idx += 1
+
+        # Invalidate caches and redraw
+        invalidate_motion_path()
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+        self.report({'INFO'}, "Strokes aligned to camera view")
+        return {'FINISHED'}
+
+
 class WONION_OT_bake_shrinkwrap(bpy.types.Operator):
     """Bake shrinkwrap offsets for entire animation range"""
     bl_idname = "world_onion.bake_shrinkwrap"
@@ -552,5 +689,6 @@ operator_classes = (
     WONION_OT_clear_anchor,
     WONION_OT_clear_all_anchors,
     WONION_OT_reload_addon,
+    WONION_OT_align_to_view,  # Rotate strokes to face camera
     WONION_OT_bake_shrinkwrap,
 )

@@ -7,6 +7,8 @@ import bpy
 import json
 from mathutils import Vector, Matrix
 
+from .transforms import get_layer_transform
+
 
 def get_anchors(gp_obj):
     """Get anchor data from GP object custom property."""
@@ -186,8 +188,11 @@ def calculate_anchor_from_strokes(gp_obj, layer, frame_number, return_local=Fals
     if len(pos_attr.data) == 0:
         return (None, None) if return_local else None
 
-    # Get world matrix for transforming local to world
+    # Get full transform matrix (object + layer) for transforming local to world
+    # This matches how strokes are transformed in cache.py
     matrix_world = gp_obj.matrix_world
+    layer_matrix = get_layer_transform(layer)
+    full_matrix = matrix_world @ layer_matrix
 
     # Compute anchor in WORLD coordinates (center XY, lowest Z)
     world_min_z = float('inf')
@@ -197,7 +202,7 @@ def calculate_anchor_from_strokes(gp_obj, layer, frame_number, return_local=Fals
 
     for p in pos_attr.data:
         local_pos = Vector(p.vector)
-        world_pos = matrix_world @ local_pos
+        world_pos = full_matrix @ local_pos
         world_sum_x += world_pos.x
         world_sum_y += world_pos.y
         if world_pos.z < world_min_z:

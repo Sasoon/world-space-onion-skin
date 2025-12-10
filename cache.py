@@ -2,11 +2,38 @@
 Cache management for world-space onion skinning.
 """
 
+import bisect
+from collections import OrderedDict
+
 import bpy
 from mathutils import Vector
 from mathutils.geometry import tessellate_polygon
 
 from .transforms import get_layer_transform
+
+
+def _find_active_keyframe(frames, current_frame):
+    """
+    Binary search for the active keyframe at or before current_frame.
+    Returns the keyframe object or None if no keyframe is at/before current_frame.
+    O(log n) instead of O(n) linear search.
+    """
+    if not frames:
+        return None
+
+    # Build sorted list of (frame_number, keyframe) pairs
+    # Blender typically keeps frames sorted, but we sort to be safe
+    sorted_frames = sorted(frames, key=lambda kf: kf.frame_number)
+    frame_numbers = [kf.frame_number for kf in sorted_frames]
+
+    # Find insertion point - the index where current_frame would be inserted
+    # to maintain sorted order
+    idx = bisect.bisect_right(frame_numbers, current_frame)
+
+    # idx-1 gives us the keyframe at or before current_frame
+    if idx > 0:
+        return sorted_frames[idx - 1]
+    return None
 
 
 def get_active_gp(context):
@@ -37,8 +64,8 @@ def triangulate_fill(world_points):
         return []
 
 
-# Global cache
-_cache = {}  # {frame_number: [stroke_points_list, ...]}
+# Global cache - OrderedDict for O(1) eviction of oldest entries
+_cache = OrderedDict()  # {frame_number: [stroke_points_list, ...]}
 
 
 def get_cache():
@@ -49,7 +76,7 @@ def get_cache():
 def clear_cache():
     """Clear all cached frames and invalidate GPU batch cache."""
     global _cache
-    _cache = {}
+    _cache = OrderedDict()
     # Also invalidate onion batch cache since stroke data changed
     try:
         from .drawing import invalidate_onion_batch_cache
@@ -84,12 +111,9 @@ def extract_strokes_at_current_frame(gp_obj, settings):
         full_matrix = world_matrix @ layer_matrix
         
         current_frame = bpy.context.scene.frame_current
-        active_kf = None
-        for kf in layer.frames:
-            if kf.frame_number <= current_frame:
-                if active_kf is None or kf.frame_number > active_kf.frame_number:
-                    active_kf = kf
-        
+        # Use binary search for O(log n) keyframe lookup
+        active_kf = _find_active_keyframe(layer.frames, current_frame)
+
         if active_kf is None:
             continue
         
@@ -190,8 +214,7 @@ def cache_current_frame(gp_obj, settings):
     strokes = extract_strokes_at_current_frame(gp_obj, settings)
     _cache[frame] = strokes
 
-    # Limit cache size
+    # Limit cache size - O(1) eviction with OrderedDict
     max_cached = 2000
     while len(_cache) > max_cached:
-        oldest = min(_cache.keys())
-        del _cache[oldest]
+        _cache.popitem(last=False)  # Remove oldest entry (FIFO)
