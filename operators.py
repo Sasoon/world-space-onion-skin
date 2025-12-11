@@ -2,6 +2,8 @@
 Operators for world-space onion skinning.
 """
 
+import time
+
 import bpy
 from mathutils import Vector, Matrix
 
@@ -51,13 +53,17 @@ def set_last_cursor_synced_frame(frame):
 
 
 class WONION_OT_cursor_sync(bpy.types.Operator):
-    """Background operator to sync cursor with GP object during playback"""
+    """Background operator to sync cursor with GP object and manage canvas visibility"""
     bl_idname = "world_onion.cursor_sync"
     bl_label = "Cursor Sync"
     bl_options = {'INTERNAL'}
 
+    # Instance variables (reset in execute)
     _timer = None
     _last_frame = None
+    _last_frame_time = None
+    _is_animating = False  # Combined play+scrub state
+    _scrub_cooldown = 0.0
 
     def modal(self, context, event):
         # Check if addon still enabled
@@ -71,39 +77,113 @@ class WONION_OT_cursor_sync(bpy.types.Operator):
             return {'CANCELLED'}
 
         if event.type == 'TIMER':
-            # Update cursor if needed
-            if settings.anchor_enabled and settings.anchor_auto_cursor:
-                current_frame = context.scene.frame_current
-                # v8.5.3: Check BOTH instance state AND shared tracker
-                # Skip if handler already updated this frame (prevents double-update jitter)
-                if (current_frame != self._last_frame and
-                    current_frame != get_last_cursor_synced_frame()):
-                    self._last_frame = current_frame
+            current_frame = context.scene.frame_current
+            current_time = time.time()
+
+            # Detect playback state
+            try:
+                is_playing = context.screen.is_animation_playing
+            except (AttributeError, RuntimeError):
+                is_playing = False
+
+            # Detect scrubbing (rapid frame changes when NOT in playback)
+            is_scrubbing = False
+            if not is_playing:
+                if current_frame != self._last_frame:
+                    if self._last_frame_time is not None:
+                        delta = current_time - self._last_frame_time
+                        is_scrubbing = delta < 0.1  # <100ms = scrubbing
+                    self._last_frame_time = current_time
+
+            # Cooldown: keep scrubbing state for 200ms after last rapid change
+            if is_scrubbing:
+                self._scrub_cooldown = 0.2
+            elif self._scrub_cooldown > 0:
+                self._scrub_cooldown -= 0.016
+                is_scrubbing = True
+
+            # Combined animation state
+            is_animating = is_playing or is_scrubbing
+
+            # State transitions: hide/show canvas
+            if is_animating and not self._is_animating:
+                self._hide_canvas(context)
+            elif not is_animating and self._is_animating:
+                # CRITICAL FIX: Sync cursor BEFORE showing canvas
+                # Without this, canvas shows at stale cursor position from before animation
+                if settings.anchor_enabled and settings.anchor_auto_cursor:
                     gp_obj = get_active_gp(context)
                     if gp_obj:
                         try:
                             depsgraph = context.evaluated_depsgraph_get()
                             gp_obj_eval = gp_obj.evaluated_get(depsgraph)
                             context.scene.cursor.location = gp_obj_eval.matrix_world.translation
-                            # Mark frame as synced so handler doesn't double-update
                             set_last_cursor_synced_frame(current_frame)
-                            # Log for debugging
-                            log(f"MODAL_CURSOR frame={current_frame}", "CURSOR")
+                            log(f"MODAL_CURSOR_ON_STOP frame={current_frame}", "CURSOR")
                         except Exception as e:
-                            log(f"MODAL_CURSOR frame={current_frame} FAILED: {e}", "ERROR")
+                            log(f"MODAL_CURSOR_ON_STOP FAILED: {e}", "ERROR")
+
+                self._show_canvas(context)
+                self._last_frame_time = None  # Reset for next scrub detection
+
+            self._is_animating = is_animating
+
+            # Track frame for scrub detection
+            if current_frame != self._last_frame:
+                self._last_frame = current_frame
+
+                # ONLY update cursor when STATIONARY (not animating)
+                # This eliminates jitter and lag during playback/scrub
+                if not is_animating:
+                    if settings.anchor_enabled and settings.anchor_auto_cursor:
+                        if current_frame != get_last_cursor_synced_frame():
+                            gp_obj = get_active_gp(context)
+                            if gp_obj:
+                                try:
+                                    depsgraph = context.evaluated_depsgraph_get()
+                                    gp_obj_eval = gp_obj.evaluated_get(depsgraph)
+                                    context.scene.cursor.location = gp_obj_eval.matrix_world.translation
+                                    set_last_cursor_synced_frame(current_frame)
+                                    log(f"MODAL_CURSOR frame={current_frame}", "CURSOR")
+                                except Exception as e:
+                                    log(f"MODAL_CURSOR frame={current_frame} FAILED: {e}", "ERROR")
 
         return {'PASS_THROUGH'}
+
+    def _hide_canvas(self, context):
+        """Hide GP canvas grid during playback/scrub."""
+        try:
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    for space in area.spaces:
+                        if space.type == 'VIEW_3D':
+                            space.overlay.use_gpencil_grid = False
+        except (AttributeError, RuntimeError):
+            pass
+
+    def _show_canvas(self, context):
+        """Show GP canvas grid when stationary."""
+        try:
+            for area in context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    for space in area.spaces:
+                        if space.type == 'VIEW_3D':
+                            space.overlay.use_gpencil_grid = True
+        except (AttributeError, RuntimeError):
+            pass
 
     def execute(self, context):
         global _cursor_sync_running
         if _cursor_sync_running:
-            # Already running
             return {'CANCELLED'}
 
+        # Initialize all state variables
+        self._last_frame = context.scene.frame_current
+        self._last_frame_time = time.time()
+        self._is_animating = False
+        self._scrub_cooldown = 0.0
+
         wm = context.window_manager
-        # v9: Reduced polling rate to 60fps (16ms) for better performance
-        # 60Hz matches typical display refresh and reduces CPU overhead significantly
-        # The handler also catches cursor updates, so this frequency is sufficient
         self._timer = wm.event_timer_add(0.016, window=context.window)
         wm.modal_handler_add(self)
         _cursor_sync_running = True
@@ -116,6 +196,8 @@ class WONION_OT_cursor_sync(bpy.types.Operator):
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
         _cursor_sync_running = False
+        # Ensure canvas is shown when modal stops
+        self._show_canvas(context)
         log("Cursor sync modal stopped", "INFO")
 
 
