@@ -207,9 +207,13 @@ def _on_depsgraph_update_impl(scene, depsgraph):
                     if update.id.name == gp_obj.animation_data.action.name:
                         animation_changed = True
 
-    # Invalidate motion path on GP data OR animation change
+    # Invalidate motion path AND onion cache on GP data OR animation change
     if gp_data_changed or animation_changed:
         invalidate_motion_path()
+        # Also invalidate onion GPU batch cache so strokes refresh immediately
+        # This fixes the "stale onion skin while editing" bug
+        from .drawing import invalidate_onion_batch_cache
+        invalidate_onion_batch_cache()
         # Force viewport redraw for immediate feedback
         _tag_viewport_redraw()
 

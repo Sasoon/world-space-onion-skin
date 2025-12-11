@@ -209,7 +209,7 @@ def cache_current_frame(gp_obj, settings):
     # (assuming settings.interpolation_enabled used to guard this)
     # For now, let's just cache if it IS a keyframe, or if we are in FRAMES mode.
     if settings.mode == 'KEYFRAMES' and not is_keyframe:
-         return
+        return
 
     strokes = extract_strokes_at_current_frame(gp_obj, settings)
     _cache[frame] = strokes

@@ -730,6 +730,10 @@ def draw_motion_path_callback():
         end_frame = int(gp_obj.animation_data.action.frame_range[1])
         
         if start_frame == end_frame:
+            # Single-frame animation - mark as handled to prevent rebuild loop
+            _motion_path_cache = None
+            _motion_path_cache_gp = gp_obj
+            _motion_path_dirty = False
             return
 
         # Sample path

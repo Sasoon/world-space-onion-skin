@@ -169,12 +169,13 @@ def calculate_anchor_from_strokes(gp_obj, layer, frame_number, return_local=Fals
     if gp_obj is None or layer is None:
         return (None, None) if return_local else None
 
-    # Find the keyframe
+    # Find the visible keyframe (at or before frame_number)
+    # This matches the logic in set_anchor_logic() for consistency
     keyframe = None
     for kf in layer.frames:
-        if kf.frame_number == frame_number:
-            keyframe = kf
-            break
+        if kf.frame_number <= frame_number:
+            if keyframe is None or kf.frame_number > keyframe.frame_number:
+                keyframe = kf
 
     if keyframe is None or keyframe.drawing is None:
         return (None, None) if return_local else None

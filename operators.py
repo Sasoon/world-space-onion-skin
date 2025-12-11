@@ -303,11 +303,23 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
             return {'CANCELLED'}
 
     # Ensure billboard constraint exists (so matrix_world is correct)
-    ensure_billboard_constraint(gp_obj, scene)
-    context.view_layer.update()
+    constraint_modified = ensure_billboard_constraint(gp_obj, scene)
 
-    # Matrix before move - include layer transform for consistency with cache.py
-    matrix_world_old = gp_obj.matrix_world.copy()
+    # If constraint was newly created/modified, force complete depsgraph rebuild
+    # view_layer.update() alone isn't enough - new constraints need full re-evaluation
+    if constraint_modified:
+        scene.frame_set(scene.frame_current)
+    else:
+        context.view_layer.update()
+
+    # Get evaluated matrix (with constraints fully applied)
+    try:
+        depsgraph = context.evaluated_depsgraph_get()
+        gp_obj_eval = gp_obj.evaluated_get(depsgraph)
+        matrix_world_old = gp_obj_eval.matrix_world.copy()
+    except (RuntimeError, AttributeError):
+        # Fallback to raw matrix if depsgraph unavailable
+        matrix_world_old = gp_obj.matrix_world.copy()
     layer_matrix = get_layer_transform(active_layer)
     full_matrix_old = matrix_world_old @ layer_matrix
 
@@ -323,13 +335,22 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
         
     # Move Object
     gp_obj.location = target_world_pos
-    
+
     # Insert Keyframe for Location
     gp_obj.keyframe_insert(data_path="location", frame=current_frame)
-    
-    # Update view layer to get new matrix
-    context.view_layer.update()
-    matrix_world_new = gp_obj.matrix_world
+
+    # CRITICAL: Use scene.frame_set() to force complete depsgraph rebuild
+    # view_layer.update() alone doesn't re-evaluate billboard constraint rotation
+    # after position change. The constraint needs to recalculate the angle to camera.
+    scene.frame_set(scene.frame_current)
+
+    # Get evaluated matrix (with constraints fully applied after frame_set)
+    try:
+        depsgraph = context.evaluated_depsgraph_get()
+        gp_obj_eval = gp_obj.evaluated_get(depsgraph)
+        matrix_world_new = gp_obj_eval.matrix_world.copy()
+    except (RuntimeError, AttributeError):
+        matrix_world_new = gp_obj.matrix_world.copy()
     # Use full matrix (object + layer) for transforming back to local space
     full_matrix_new = matrix_world_new @ layer_matrix
     full_matrix_new_inv = full_matrix_new.inverted()
@@ -398,8 +419,11 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
                 new_local = full_matrix_new_inv @ p_world
                 stroke.points[j].position = new_local
 
-    # Explicitly invalidate motion path and request redraw
+    # Explicitly invalidate motion path and onion cache, then request redraw
     invalidate_motion_path()
+    # Also invalidate onion GPU batch cache since stroke local positions changed
+    from .drawing import invalidate_onion_batch_cache
+    invalidate_onion_batch_cache()
     for area in context.screen.areas:
         if area.type == 'VIEW_3D':
             area.tag_redraw()
