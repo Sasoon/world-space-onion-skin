@@ -10,14 +10,47 @@ from mathutils import Vector, Matrix
 from .transforms import get_layer_transform
 
 
-def get_anchors(gp_obj):
-    """Get anchor data from GP object custom property."""
+# JSON cache - avoid re-parsing JSON on every anchor lookup
+_anchor_json_cache = None
+_anchor_json_cache_gp = None
+
+
+def invalidate_anchor_json_cache():
+    """Clear anchor JSON cache. Call when anchor data changes."""
+    global _anchor_json_cache, _anchor_json_cache_gp
+    _anchor_json_cache = None
+    _anchor_json_cache_gp = None
+
+
+def _invalidate_all_anchor_caches():
+    """Invalidate both JSON cache and GPU batch cache."""
+    invalidate_anchor_json_cache()
+    # Also invalidate GPU batch cache (import here to avoid circular import)
+    try:
+        from .drawing import invalidate_anchor_batch_cache
+        invalidate_anchor_batch_cache()
+    except ImportError:
+        pass
+
+
+def get_anchors(gp_obj, use_cache=True):
+    """Get anchor data from GP object custom property.
+
+    PERFORMANCE: Uses module-level cache to avoid JSON parsing on every call.
+    Pass use_cache=False to bypass cache (e.g., after external modification).
+    """
+    global _anchor_json_cache, _anchor_json_cache_gp
+
     if gp_obj is None:
         return {}
-    
+
+    # Check cache first (identity comparison for speed)
+    if use_cache and gp_obj is _anchor_json_cache_gp and _anchor_json_cache is not None:
+        return _anchor_json_cache
+
     if "world_onion_anchors" not in gp_obj:
         return {}
-    
+
     try:
         data = json.loads(gp_obj["world_onion_anchors"])
 
@@ -28,6 +61,10 @@ def get_anchors(gp_obj):
                 if isinstance(anchor_data, list):
                     # Legacy format: just position as list
                     data[layer_name][frame_str] = {"pos": anchor_data}
+
+        # Update cache
+        _anchor_json_cache = data
+        _anchor_json_cache_gp = gp_obj
 
         return data
     except (json.JSONDecodeError, TypeError, KeyError):
@@ -40,6 +77,8 @@ def set_anchors(gp_obj, anchors):
     if gp_obj is None:
         return
     gp_obj["world_onion_anchors"] = json.dumps(anchors)
+    # Invalidate caches since anchor data changed
+    _invalidate_all_anchor_caches()
 
 
 def get_anchor_for_frame(gp_obj, layer_name, frame):
@@ -258,6 +297,8 @@ def get_all_anchor_positions(gp_obj, settings):
     """Get all anchor positions for display.
 
     Returns list of (Vector position, bool is_current_frame).
+
+    PERFORMANCE: Uses dict lookup for layers (O(1)) instead of O(n) search per anchor.
     """
     if gp_obj is None:
         return []
@@ -266,17 +307,17 @@ def get_all_anchor_positions(gp_obj, settings):
     current_frame = bpy.context.scene.frame_current
     anchors = get_anchors(gp_obj)
 
-    for layer_name, layer_anchors in anchors.items():
-        # Check if layer exists and is visible
-        layer = None
-        for l in gp_obj.data.layers:
-            if l.name == layer_name:
-                layer = l
-                break
+    if not anchors:
+        return result
 
-        if layer is None:
-            continue
-        if layer.hide:
+    # Build layer lookup dict ONCE (O(n) instead of O(n*m))
+    layer_dict = {l.name: l for l in gp_obj.data.layers}
+
+    for layer_name, layer_anchors in anchors.items():
+        # O(1) layer lookup instead of O(n) loop
+        layer = layer_dict.get(layer_name)
+
+        if layer is None or layer.hide:
             continue
 
         for frame_str, anchor_data in layer_anchors.items():

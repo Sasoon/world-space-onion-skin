@@ -9,7 +9,7 @@ from datetime import datetime
 
 # Log file path (same directory as this module)
 _LOG_FILE = os.path.join(os.path.dirname(__file__), "debug.log")
-_ENABLED = True  # ENABLED for debugging snap issue
+_ENABLED = False  # Set to True only for debugging (disk I/O in hot paths)
 _MAX_LINES = 500  # Keep last N lines to prevent huge files
 
 def _get_timestamp():

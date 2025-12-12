@@ -72,10 +72,10 @@ def on_frame_change(scene):
     Called AFTER frame change is complete.
     Caches the current frame's world-space strokes.
     Ensures billboard constraint.
-    v8.5.2: Hybrid cursor sync - handler catches frames missed by modal during playback.
-    """
-    global _last_keyframe_set
 
+    PERFORMANCE: Keyframe set update moved to depsgraph handler (P5).
+    Only recomputed when GP data actually changes, not every frame.
+    """
     if not hasattr(scene, 'world_onion'):
         return
 
@@ -99,33 +99,12 @@ def on_frame_change(scene):
         from .drawing import ensure_shrinkwrap_valid
         ensure_shrinkwrap_valid(gp_obj, settings, scene)
 
-    # === v8: DRIVER HANDLES OFFSET AUTOMATICALLY ===
-    # The driver on delta_location.z reads from the animated custom property
-    # "_shrinkwrap_z_offset" which was baked during the bake operation.
-    # No Python code needed here - Blender's native driver system handles it!
-
     # === ONION SKIN CACHE ===
     # Cache strokes for onion skin drawing
-    # Note: The driver applies offset via delta_location, but we cache the
-    # "raw" stroke positions (from matrix_world without delta). The offset
-    # is applied during GPU drawing via get_baked_offset(frame).
     cache_current_frame(gp_obj, settings)
 
-    # === ANCHOR SYSTEM ===
-    if settings.anchor_enabled:
-        # Update keyframe tracking set on frame change
-        _last_keyframe_set = get_current_keyframes_set(gp_obj, settings)
-
-        # NOTE: Cursor sync is handled ONLY by the modal operator (WONION_OT_cursor_sync)
-        # The modal has sophisticated playback/scrub detection and only syncs cursor
-        # when stationary. Handler-based sync was causing race conditions where
-        # cursor would animate during playback (inconsistent, performance cost).
-
-    # === MOTION PATH ===
-    # NOTE: Motion path invalidation REMOVED from frame change handler.
-    # The path only needs rebuilding when animation data changes (handled in
-    # on_depsgraph_update) or shrinkwrap settings change (handled in settings.py).
-    # Invalidating on every frame was causing massive performance overhead.
+    # NOTE: Keyframe set update moved to depsgraph handler (P5 optimization)
+    # Only updates when gp_data_changed, not on every frame scrub.
 
     # Request viewport redraw - use efficient helper with early exit
     _tag_viewport_redraw()
@@ -152,7 +131,11 @@ def on_depsgraph_update(scene, depsgraph):
 
 
 def _on_depsgraph_update_impl(scene, depsgraph):
-    """Implementation of depsgraph update handler."""
+    """Implementation of depsgraph update handler.
+
+    PERFORMANCE (P8): Uses identity checks and cached attribute lookups.
+    PERFORMANCE (P5): Keyframe set update moved here from frame_change handler.
+    """
     global _last_keyframe_set, _last_active_layer_name, _last_active_gp
 
     if not hasattr(scene, 'world_onion'):
@@ -165,11 +148,8 @@ def _on_depsgraph_update_impl(scene, depsgraph):
     # Get active GP object
     gp_obj = get_active_gp(bpy.context)
 
-    # v8.5: Cursor update moved to modal operator (WONION_OT_cursor_sync)
-    # The modal handles cursor updates reliably - no backup needed here.
-
     # Detect active GP object change - clear cache when switching
-    if gp_obj != _last_active_gp:
+    if gp_obj is not _last_active_gp:  # Identity check (P8)
         if _last_active_gp is not None:
             clear_cache()
             _last_active_layer_name = None
@@ -178,40 +158,44 @@ def _on_depsgraph_update_impl(scene, depsgraph):
     if gp_obj is None:
         return
 
+    # Cache lookups before loop (P8 optimization)
     gp_data = gp_obj.data
+    anim_data = gp_obj.animation_data
+    action = anim_data.action if anim_data else None
+
     gp_data_changed = False
     animation_changed = False
 
     # Check updates - with early exit once both flags found
     for update in depsgraph.updates:
-        # Early exit optimization - stop iterating once we know both flags
         if gp_data_changed and animation_changed:
             break
 
-        # GP stroke data changed
+        update_id = update.id
+
+        # GP stroke data changed - use identity check (P8)
         if not gp_data_changed:
-            if update.id == gp_data:
+            if update_id is gp_data:
                 gp_data_changed = True
-            elif isinstance(update.id, bpy.types.GreasePencil) and update.id.name == gp_data.name:
+            elif isinstance(update_id, bpy.types.GreasePencil) and update_id.name == gp_data.name:
                 gp_data_changed = True
 
-        # Animation data changed (Location keyframes added/deleted/moved)
-        if not animation_changed:
-            if gp_obj.animation_data and update.id == gp_obj.animation_data.action:
+        # Animation data changed - use identity check with cached action (P8)
+        if not animation_changed and action is not None:
+            if update_id is action:
                 animation_changed = True
-            elif isinstance(update.id, bpy.types.Action):
-                # Check if this action belongs to our GP object
-                if gp_obj.animation_data and gp_obj.animation_data.action:
-                    if update.id.name == gp_obj.animation_data.action.name:
-                        animation_changed = True
+            elif isinstance(update_id, bpy.types.Action) and update_id.name == action.name:
+                animation_changed = True
 
     # Invalidate motion path AND onion cache on GP data OR animation change
     if gp_data_changed or animation_changed:
         invalidate_motion_path()
         # Also invalidate onion GPU batch cache so strokes refresh immediately
         # This fixes the "stale onion skin while editing" bug
-        from .drawing import invalidate_onion_batch_cache
+        from .drawing import invalidate_onion_batch_cache, invalidate_keyframe_cache
         invalidate_onion_batch_cache()
+        # P7: Also invalidate keyframe cache since keyframes may have changed
+        invalidate_keyframe_cache()
         # Force viewport redraw for immediate feedback
         _tag_viewport_redraw()
 
@@ -226,48 +210,51 @@ def _on_depsgraph_update_impl(scene, depsgraph):
             # and we're already in a handler context. Driver will pick up new baked
             # values on the next frame naturally.
 
-    # Detect keyframe changes
-    if gp_data_changed and _last_keyframe_set:
+    # Detect keyframe changes (P5: only when GP data changes, not every frame)
+    if gp_data_changed:
         current_kf_set = get_current_keyframes_set(gp_obj, settings)
-        
-        # Track moved keyframes for anchor migration
-        removed_by_layer = {}
-        added_by_layer = {}
 
-        for layer_name, frame in (_last_keyframe_set - current_kf_set):
-            removed_by_layer.setdefault(layer_name, []).append(frame)
+        # Only do comparison if we have a previous set to compare against
+        # On first run, _last_keyframe_set is empty - just initialize it
+        if _last_keyframe_set:
+            # Track moved keyframes for anchor migration
+            removed_by_layer = {}
+            added_by_layer = {}
 
-        for layer_name, frame in (current_kf_set - _last_keyframe_set):
-            added_by_layer.setdefault(layer_name, []).append(frame)
+            for layer_name, frame in (_last_keyframe_set - current_kf_set):
+                removed_by_layer.setdefault(layer_name, []).append(frame)
 
-        # Check for moves
-        for layer_name in removed_by_layer:
-            if layer_name in added_by_layer:
-                removed = removed_by_layer[layer_name]
-                added = added_by_layer[layer_name]
-                if len(removed) == 1 and len(added) == 1:
-                    old_frame = removed[0]
-                    new_frame = added[0]
-                    migrate_anchor_data(gp_obj, layer_name, old_frame, new_frame)
-                elif len(removed) == len(added):
-                    removed_sorted = sorted(removed)
-                    added_sorted = sorted(added)
-                    for old_frame, new_frame in zip(removed_sorted, added_sorted):
+            for layer_name, frame in (current_kf_set - _last_keyframe_set):
+                added_by_layer.setdefault(layer_name, []).append(frame)
+
+            # Check for moves
+            for layer_name in removed_by_layer:
+                if layer_name in added_by_layer:
+                    removed = removed_by_layer[layer_name]
+                    added = added_by_layer[layer_name]
+                    if len(removed) == 1 and len(added) == 1:
+                        old_frame = removed[0]
+                        new_frame = added[0]
                         migrate_anchor_data(gp_obj, layer_name, old_frame, new_frame)
+                    elif len(removed) == len(added):
+                        removed_sorted = sorted(removed)
+                        added_sorted = sorted(added)
+                        for old_frame, new_frame in zip(removed_sorted, added_sorted):
+                            migrate_anchor_data(gp_obj, layer_name, old_frame, new_frame)
 
-        # Handle new keyframes
-        if settings.anchor_enabled:
-            current_frame = scene.frame_current
-            new_keyframes = current_kf_set - _last_keyframe_set
+            # Handle new keyframes
+            if settings.anchor_enabled:
+                current_frame = scene.frame_current
+                new_keyframes = current_kf_set - _last_keyframe_set
 
-            for layer_name, frame_num in new_keyframes:
-                if frame_num == current_frame:
-                    # Capture cursor as anchor for new keyframes
-                    existing_anchor = get_anchor_for_frame(gp_obj, layer_name, frame_num)
-                    if existing_anchor is None:
-                        cursor_pos = scene.cursor.location.copy()
-                        cam_dir = get_camera_direction(scene)
-                        set_anchor_for_frame(gp_obj, layer_name, frame_num, cursor_pos, cam_dir)
+                for layer_name, frame_num in new_keyframes:
+                    if frame_num == current_frame:
+                        # Capture cursor as anchor for new keyframes
+                        existing_anchor = get_anchor_for_frame(gp_obj, layer_name, frame_num)
+                        if existing_anchor is None:
+                            cursor_pos = scene.cursor.location.copy()
+                            cam_dir = get_camera_direction(scene)
+                            set_anchor_for_frame(gp_obj, layer_name, frame_num, cursor_pos, cam_dir)
 
         _last_keyframe_set = current_kf_set
 
@@ -289,8 +276,9 @@ def on_undo_post(scene):
     """
     clear_cache()
     invalidate_motion_path()
-    from .drawing import invalidate_onion_batch_cache
+    from .drawing import invalidate_onion_batch_cache, invalidate_keyframe_cache
     invalidate_onion_batch_cache()
+    invalidate_keyframe_cache()  # P7: Keyframes may have been undone
     _tag_viewport_redraw()
     log("UNDO detected - cleared all caches", "INFO")
 

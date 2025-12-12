@@ -17,22 +17,23 @@ def _find_active_keyframe(frames, current_frame):
     Binary search for the active keyframe at or before current_frame.
     Returns the keyframe object or None if no keyframe is at/before current_frame.
     O(log n) instead of O(n) linear search.
+
+    Note: Blender keeps layer.frames sorted by frame_number internally,
+    so we skip the O(n log n) sort and just build the frame_numbers list.
     """
     if not frames:
         return None
 
-    # Build sorted list of (frame_number, keyframe) pairs
-    # Blender typically keeps frames sorted, but we sort to be safe
-    sorted_frames = sorted(frames, key=lambda kf: kf.frame_number)
-    frame_numbers = [kf.frame_number for kf in sorted_frames]
+    # Blender keeps frames sorted - just extract frame numbers for bisect
+    # This is O(n) list creation vs O(n log n) sorting on every call
+    frame_numbers = [kf.frame_number for kf in frames]
 
     # Find insertion point - the index where current_frame would be inserted
-    # to maintain sorted order
     idx = bisect.bisect_right(frame_numbers, current_frame)
 
     # idx-1 gives us the keyframe at or before current_frame
     if idx > 0:
-        return sorted_frames[idx - 1]
+        return frames[idx - 1]
     return None
 
 
@@ -77,10 +78,11 @@ def clear_cache():
     """Clear all cached frames and invalidate GPU batch cache."""
     global _cache
     _cache = OrderedDict()
-    # Also invalidate onion batch cache since stroke data changed
+    # Also invalidate onion batch and keyframe cache since stroke data changed
     try:
-        from .drawing import invalidate_onion_batch_cache
+        from .drawing import invalidate_onion_batch_cache, invalidate_keyframe_cache
         invalidate_onion_batch_cache()
+        invalidate_keyframe_cache()  # P7: Keyframes may have changed
     except ImportError:
         pass  # drawing module not loaded yet
 
@@ -190,26 +192,33 @@ def extract_strokes_at_current_frame(gp_obj, settings):
 
 
 def cache_current_frame(gp_obj, settings):
-    """Cache strokes for the current frame."""
+    """Cache strokes for the current frame.
+
+    PERFORMANCE: In KEYFRAMES mode, uses binary search to check if current
+    frame is a keyframe, instead of O(layers × keyframes) full scan.
+    """
     global _cache
     frame = bpy.context.scene.frame_current
 
     # In KEYFRAMES mode, only cache if this is effectively a keyframe
-    # We can check if any layer has a keyframe at exactly this frame
-    is_keyframe = False
-    for layer in gp_obj.data.layers:
-        for kf in layer.frames:
-            if kf.frame_number == frame:
-                is_keyframe = True
-                break
-        if is_keyframe:
-            break
+    if settings.mode == 'KEYFRAMES':
+        # Use binary search per layer instead of full scan
+        is_keyframe = False
+        for layer in gp_obj.data.layers:
+            if layer.hide:
+                continue
+            # Blender keeps layer.frames sorted - use binary search
+            frames = layer.frames
+            if frames:
+                # Quick check: binary search for exact frame match
+                frame_numbers = [kf.frame_number for kf in frames]
+                idx = bisect.bisect_left(frame_numbers, frame)
+                if idx < len(frame_numbers) and frame_numbers[idx] == frame:
+                    is_keyframe = True
+                    break
 
-    # If we are in 'KEYFRAMES' mode and strictly want only keyframes
-    # (assuming settings.interpolation_enabled used to guard this)
-    # For now, let's just cache if it IS a keyframe, or if we are in FRAMES mode.
-    if settings.mode == 'KEYFRAMES' and not is_keyframe:
-        return
+        if not is_keyframe:
+            return
 
     strokes = extract_strokes_at_current_frame(gp_obj, settings)
     _cache[frame] = strokes

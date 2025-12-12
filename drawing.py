@@ -52,6 +52,13 @@ _onion_cache_gp = None  # Track GP object to detect changes
 _keyframe_cache = None  # Sorted list of keyframe numbers
 _keyframe_cache_gp = None  # GP object the cache is for
 
+# Anchor batch cache - avoid creating GPU batches per anchor per redraw
+# Structure: {'points': batch, 'lines': batch, 'current_points': batch, 'current_lines': batch}
+_anchor_batch_cache = None
+_anchor_batch_gp = None  # GP object the cache is for
+_anchor_batch_dirty = True  # Force rebuild when anchors change
+_anchor_batch_frame = None  # Track frame to detect current anchor changes
+
 # v8.5: Timer code removed - now using modal operator in operators.py
 
 # Cached shaders (lazy initialized to avoid GPU calls at import time)
@@ -86,15 +93,28 @@ def invalidate_motion_path():
 
 
 def invalidate_onion_batch_cache():
-    """Clear all cached onion skin GPU batches. Call when stroke data changes."""
+    """Clear onion skin GPU batches only.
+
+    PERFORMANCE (P7): Does NOT clear keyframe cache.
+    Call invalidate_keyframe_cache() separately when keyframes change.
+    """
     global _onion_batch_cache, _onion_cache_z_offset, _onion_cache_gp
-    global _keyframe_cache, _keyframe_cache_gp
     _onion_batch_cache = {}
     _onion_cache_z_offset = None
     _onion_cache_gp = None
-    # Also clear keyframe cache since keyframes may have changed
+
+
+def invalidate_keyframe_cache():
+    """Clear keyframe cache. Call when GP keyframes are added/removed/moved."""
+    global _keyframe_cache, _keyframe_cache_gp
     _keyframe_cache = None
     _keyframe_cache_gp = None
+
+
+def invalidate_anchor_batch_cache():
+    """Mark anchor batches for rebuild. Call when anchor data changes."""
+    global _anchor_batch_dirty
+    _anchor_batch_dirty = True
 
 
 def invalidate_baked_offsets():
@@ -601,69 +621,78 @@ def draw_onion_callback():
     try:
         region = bpy.context.region
 
-        # Draw each cached frame
+        # PERFORMANCE: Two-pass rendering reduces shader binds from 2N to 2
+        # First pass: all fills with fill_shader bound once
+        # Second pass: all strokes with stroke_shader bound once
+
+        # Pre-compute draw data for all frames (cached_batches + colors)
+        # This avoids recomputing colors in each pass
+        draw_data = []  # List of (cached_batches, fill_color, stroke_color)
+
+        # Cache common settings lookups
+        depth_enabled = settings.depth_interaction_enabled
+        bake_valid = is_bake_valid() if depth_enabled else False
+        color_before = settings.color_before
+        color_after = settings.color_after
+        fill_opacity = settings.fill_opacity
+        stroke_opacity = settings.opacity
+        falloff = settings.falloff
+        max_offset = max(settings.frames_before, settings.frames_after, 1)
+
         for frame_offset, frame in frames_to_show:
-            if frame not in cache:
-                continue
-            if frame == current_frame:
+            if frame not in cache or frame == current_frame:
                 continue
 
             strokes = cache[frame]
             if not strokes:
                 continue
 
-            # Calculate z_offset for this frame (includes per-frame baked offset)
+            # Calculate z_offset for this frame
             z_offset = base_z_offset
-            if settings.depth_interaction_enabled and is_bake_valid():
+            if depth_enabled and bake_valid:
                 baked_offset = get_baked_offset(frame)
                 if baked_offset is not None:
                     z_offset += baked_offset
 
-            # Cache key includes frame and z_offset (rounded to avoid float precision issues)
+            # Cache key includes frame and z_offset
             cache_key = (frame, round(z_offset, 4))
 
-            # Check if batches are cached for this frame
+            # Get or build cached batches
             if cache_key not in _onion_batch_cache:
-                # Build and cache batches
                 _onion_batch_cache[cache_key] = _build_onion_batches_for_frame(
                     frame, strokes, z_offset, fill_shader, stroke_shader
                 )
 
             cached_batches = _onion_batch_cache[cache_key]
 
-            # DEBUG: Log onion draw
-            log_onion_draw(current_frame, frame, z_offset, len(strokes))
-
-            # Calculate color based on before/after
-            if frame < current_frame:
-                base_color = settings.color_before
-            else:
-                base_color = settings.color_after
-
-            # Calculate opacity with falloff
+            # Calculate colors
+            base_color = color_before if frame < current_frame else color_after
             abs_offset = abs(frame_offset)
-            max_offset = max(settings.frames_before, settings.frames_after, 1)
-            falloff_factor = 1.0 - (abs_offset / max_offset) * settings.falloff if settings.falloff > 0 else 1.0
+            falloff_factor = 1.0 - (abs_offset / max_offset) * falloff if falloff > 0 else 1.0
+            falloff_clamped = max(0.1, falloff_factor)
 
-            # PASS 1: Draw fills (set color, draw all cached fill batches)
-            fill_alpha = settings.fill_opacity * max(0.1, falloff_factor)
-            fill_color = (base_color[0], base_color[1], base_color[2], fill_alpha)
+            fill_color = (base_color[0], base_color[1], base_color[2], fill_opacity * falloff_clamped)
+            stroke_color = (base_color[0], base_color[1], base_color[2], stroke_opacity * falloff_clamped)
 
-            fill_shader.bind()
-            fill_shader.uniform_float("color", fill_color)
-            for batch in cached_batches['fill_batches']:
-                batch.draw(fill_shader)
+            draw_data.append((cached_batches, fill_color, stroke_color))
 
-            # PASS 2: Draw strokes (set color, draw all cached stroke batches)
-            stroke_alpha = settings.opacity * max(0.1, falloff_factor)
-            stroke_color = (base_color[0], base_color[1], base_color[2], stroke_alpha)
+        # PASS 1: Draw all fills (bind shader ONCE)
+        fill_shader.bind()
+        for cached_batches, fill_color, _ in draw_data:
+            if cached_batches['fill_batches']:
+                fill_shader.uniform_float("color", fill_color)
+                for batch in cached_batches['fill_batches']:
+                    batch.draw(fill_shader)
 
-            stroke_shader.bind()
-            stroke_shader.uniform_float("viewportSize", (region.width, region.height))
-            stroke_shader.uniform_float("lineWidth", settings.line_width)
-            stroke_shader.uniform_float("color", stroke_color)
-            for batch in cached_batches['stroke_batches']:
-                batch.draw(stroke_shader)
+        # PASS 2: Draw all strokes (bind shader ONCE)
+        stroke_shader.bind()
+        stroke_shader.uniform_float("viewportSize", (region.width, region.height))
+        stroke_shader.uniform_float("lineWidth", settings.line_width)
+        for cached_batches, _, stroke_color in draw_data:
+            if cached_batches['stroke_batches']:
+                stroke_shader.uniform_float("color", stroke_color)
+                for batch in cached_batches['stroke_batches']:
+                    batch.draw(stroke_shader)
 
     finally:
         # Reset GPU state (always runs, even if exception occurs)
@@ -747,7 +776,12 @@ def get_regular_frames(settings, current_frame):
 def draw_anchor_callback():
     """
     GPU draw callback - renders anchor position indicators.
+
+    PERFORMANCE: Uses batch caching to avoid creating GPU batches per anchor
+    on every viewport redraw. Batches are rebuilt only when anchors change.
     """
+    global _anchor_batch_cache, _anchor_batch_gp, _anchor_batch_dirty, _anchor_batch_frame
+
     try:
         scene = bpy.context.scene
     except (RuntimeError, AttributeError):
@@ -755,12 +789,12 @@ def draw_anchor_callback():
 
     if not hasattr(scene, 'world_onion'):
         return
-    
+
     settings = scene.world_onion
-    
+
     if not settings.enabled:
         return
-    
+
     if not settings.anchor_enabled:
         return
 
@@ -769,50 +803,87 @@ def draw_anchor_callback():
     if gp_obj is None:
         return
 
-    # Get all anchor positions
-    anchor_data = get_all_anchor_positions(gp_obj, settings)
+    current_frame = scene.frame_current
 
-    if not anchor_data:
+    # Check if GP object or frame changed -> force cache rebuild
+    # Frame change affects which anchor is "current"
+    if _anchor_batch_gp != gp_obj:
+        _anchor_batch_dirty = True
+        _anchor_batch_gp = gp_obj
+    elif _anchor_batch_frame != current_frame:
+        _anchor_batch_dirty = True
+
+    # Rebuild batches if dirty
+    if _anchor_batch_dirty or _anchor_batch_cache is None:
+        # Get all anchor positions
+        anchor_data = get_all_anchor_positions(gp_obj, settings)
+
+        if not anchor_data:
+            _anchor_batch_cache = None
+            _anchor_batch_dirty = False
+            return
+
+        # Build geometry for all anchors at once
+        other_points = []
+        other_lines = []
+        current_points = []
+        current_lines = []
+
+        size = 0.05
+        for pos, is_current in anchor_data:
+            pt_list = current_points if is_current else other_points
+            ln_list = current_lines if is_current else other_lines
+
+            pt_list.append((pos.x, pos.y, pos.z))
+            # Cross lines (3 axes)
+            ln_list.extend([
+                (pos.x - size, pos.y, pos.z), (pos.x + size, pos.y, pos.z),
+                (pos.x, pos.y - size, pos.z), (pos.x, pos.y + size, pos.z),
+                (pos.x, pos.y, pos.z - size), (pos.x, pos.y, pos.z + size),
+            ])
+
+        shader = _get_fill_shader()
+        _anchor_batch_cache = {
+            'other_points': batch_for_shader(shader, 'POINTS', {"pos": other_points}) if other_points else None,
+            'other_lines': batch_for_shader(shader, 'LINES', {"pos": other_lines}) if other_lines else None,
+            'current_points': batch_for_shader(shader, 'POINTS', {"pos": current_points}) if current_points else None,
+            'current_lines': batch_for_shader(shader, 'LINES', {"pos": current_lines}) if current_lines else None,
+        }
+        _anchor_batch_dirty = False
+        _anchor_batch_frame = current_frame
+
+    if _anchor_batch_cache is None:
         return
 
-    shader = _get_fill_shader()  # Use cached shader
-
+    # Set up GPU state
+    shader = _get_fill_shader()
     gpu.state.blend_set('ALPHA')
-    gpu.state.point_size_set(12.0)
     gpu.state.depth_test_set('LESS_EQUAL')
     gpu.state.depth_mask_set(False)
+    shader.bind()
 
-    shader.bind()  # Bind once at start
+    # Draw other anchors (dimmer)
+    other_color = (0.8, 0.6, 0.0, 0.4)
+    if _anchor_batch_cache['other_points']:
+        gpu.state.point_size_set(12.0)
+        shader.uniform_float("color", other_color)
+        _anchor_batch_cache['other_points'].draw(shader)
+    if _anchor_batch_cache['other_lines']:
+        gpu.state.line_width_set(1.0)
+        shader.uniform_float("color", other_color)
+        _anchor_batch_cache['other_lines'].draw(shader)
 
-    # Draw each anchor
-    for pos, is_current in anchor_data:
-        if is_current:
-            # Current keyframe's anchor - bright yellow
-            color = (1.0, 0.9, 0.0, 0.9)
-        else:
-            # Other anchors - dimmer
-            color = (0.8, 0.6, 0.0, 0.4)
+    # Draw current anchor (bright yellow)
+    current_color = (1.0, 0.9, 0.0, 0.9)
+    if _anchor_batch_cache['current_points']:
+        gpu.state.point_size_set(12.0)
+        shader.uniform_float("color", current_color)
+        _anchor_batch_cache['current_points'].draw(shader)
+    if _anchor_batch_cache['current_lines']:
+        gpu.state.line_width_set(2.0)
+        shader.uniform_float("color", current_color)
+        _anchor_batch_cache['current_lines'].draw(shader)
 
-        # Draw as a point
-        shader.uniform_float("color", color)
-        batch = batch_for_shader(shader, 'POINTS', {"pos": [pos]})
-        batch.draw(shader)
-        
-        # Draw a small cross for visibility
-        size = 0.05
-        cross_lines = [
-            (pos.x - size, pos.y, pos.z),
-            (pos.x + size, pos.y, pos.z),
-            (pos.x, pos.y - size, pos.z),
-            (pos.x, pos.y + size, pos.z),
-            (pos.x, pos.y, pos.z - size),
-            (pos.x, pos.y, pos.z + size),
-        ]
-        batch = batch_for_shader(shader, 'LINES', {"pos": cross_lines})
-        gpu.state.line_width_set(2.0 if is_current else 1.0)
-        shader.uniform_float("color", color)
-        batch.draw(shader)
-    
     # Reset GPU state
     gpu.state.blend_set('NONE')
     gpu.state.depth_test_set('NONE')
