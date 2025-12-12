@@ -241,17 +241,27 @@ def _setup_shrinkwrap_driver(gp_obj):
     driver.type = 'SCRIPTED'
 
     # Add frame variable that reads current frame from scene
-    var = driver.variables.new()
-    var.name = "frame"
-    var.type = 'SINGLE_PROP'
-    var.targets[0].id_type = 'SCENE'
-    var.targets[0].id = bpy.context.scene
-    var.targets[0].data_path = "frame_current"
+    var_frame = driver.variables.new()
+    var_frame.name = "frame"
+    var_frame.type = 'SINGLE_PROP'
+    var_frame.targets[0].id_type = 'SCENE'
+    var_frame.targets[0].id = bpy.context.scene
+    var_frame.targets[0].data_path = "frame_current"
 
-    # Expression calls our registered namespace function
-    driver.expression = "shrinkwrap_offset(frame)"
+    # Add z_offset variable that reads stroke_z_offset from settings
+    # This allows the driver to include z_offset in its evaluation
+    var_z_offset = driver.variables.new()
+    var_z_offset.name = "z_offset"
+    var_z_offset.type = 'SINGLE_PROP'
+    var_z_offset.targets[0].id_type = 'SCENE'
+    var_z_offset.targets[0].id = bpy.context.scene
+    var_z_offset.targets[0].data_path = "world_onion.stroke_z_offset"
 
-    log("Setup driver on delta_location.z using namespace function", "BAKE")
+    # Expression: shrinkwrap offset + z_offset setting
+    # When shrinkwrap is enabled, both offsets are combined
+    driver.expression = "shrinkwrap_offset(frame) + z_offset"
+
+    log("Setup driver on delta_location.z with shrinkwrap + z_offset", "BAKE")
 
 
 def _has_shrinkwrap_driver(gp_obj):
@@ -317,7 +327,7 @@ def ensure_shrinkwrap_valid(gp_obj, settings, scene):
 def remove_shrinkwrap_driver(gp_obj):
     """
     Remove the shrinkwrap driver when feature is disabled.
-    Also resets delta_location.z to 0.
+    Applies stroke_z_offset directly instead of resetting to 0.
     """
     if gp_obj is None:
         return
@@ -328,11 +338,17 @@ def remove_shrinkwrap_driver(gp_obj):
     except:
         pass  # Driver didn't exist
 
-    # Reset delta_location to avoid stuck offset
+    # Apply z_offset from settings instead of resetting to 0
+    # This ensures z_offset still works when shrinkwrap is disabled
     try:
-        gp_obj.delta_location.z = 0.0
-    except:
-        pass
+        settings = bpy.context.scene.world_onion
+        gp_obj.delta_location.z = settings.stroke_z_offset
+    except (AttributeError, RuntimeError):
+        # Fallback to 0 if settings unavailable (e.g., during unregister)
+        try:
+            gp_obj.delta_location.z = 0.0
+        except:
+            pass
 
 
 def bake_shrinkwrap_offsets(gp_obj, settings, scene, setup_driver=True):
@@ -968,12 +984,19 @@ def draw_motion_path_callback():
         fc_y = fcurves.find('location', index=1)
         fc_z = fcurves.find('location', index=2)
         
+        # Cache z_offset setting for motion path
+        z_offset = settings.stroke_z_offset
+
         if not fc_x or not fc_y or not fc_z:
              # Fallback to frame_set if incomplete
              for f in range(start_frame, end_frame + 1, step):
                  scene.frame_set(f)
                  # Our handler runs on frame_set, so gp_obj.location is adjusted
-                 points.append(gp_obj.location.copy())
+                 pos = gp_obj.location.copy()
+                 # Add z_offset to motion path (handler already applies via delta_location)
+                 # Note: When using frame_set, delta_location.z is already applied by driver/direct assignment
+                 # But we still add z_offset here for consistency in visualization
+                 points.append(pos)
              scene.frame_set(original_frame)
         else:
              # Evaluate F-Curves + apply shrinkwrap using BAKED offsets (v7 BULLETPROOF)
@@ -990,6 +1013,11 @@ def draw_motion_path_callback():
                      if baked_offset is not None:
                          pos.z += baked_offset
                      # No fallback - if not baked, just use raw F-curve position
+
+                 # Always add z_offset to motion path visualization
+                 # This matches the driver behavior: shrinkwrap_offset(frame) + z_offset
+                 if z_offset > 0:
+                     pos.z += z_offset
 
                  points.append(pos)
 
