@@ -70,6 +70,17 @@ def on_load_post(dummy):
     for scene in bpy.data.scenes:
         if hasattr(scene, 'world_onion') and scene.world_onion.enabled:
             drawing.register_draw_handlers()
+
+            # v9.3: Re-bake shrinkwrap if it was enabled
+            # Module globals are reset on file load, so baked offset dictionary is empty.
+            # Without this, driver returns 0.0 and shrinkwrap doesn't work until user scrubs.
+            # on_load_post() is a safe context - driver setup will succeed here.
+            if scene.world_onion.depth_interaction_enabled:
+                gp_obj = cache.get_active_gp(bpy.context)
+                if gp_obj:
+                    drawing.bake_shrinkwrap_offsets(gp_obj, scene.world_onion, scene, setup_driver=True)
+                    scene.frame_set(scene.frame_current)
+
             # v8.5: Start cursor sync modal operator
             from .operators import is_cursor_sync_running
             if not is_cursor_sync_running():

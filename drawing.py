@@ -34,6 +34,12 @@ _motion_path_point_batch = None
 _baked_shrinkwrap_offsets = {}
 _baked_offset_valid = False  # True after successful bake
 
+# v9.3: Context-aware driver management
+# Driver setup can only happen in safe contexts (UI callbacks, operators, file load)
+# NOT in frame_change or depsgraph_update handlers (restricted context)
+_driver_setup_pending = False  # True if driver needs setup from next safe context
+_bake_in_progress = False  # Guard against overlapping bakes
+
 # Onion skin GPU batch cache - CRITICAL for performance near camera
 # Structure: {frame: {'fill_batches': [batch, ...], 'stroke_batches': [batch, ...]}}
 # Batches are keyed by frame and built once, reused on every redraw
@@ -112,6 +118,51 @@ def is_bake_valid():
     return _baked_offset_valid
 
 
+def _is_safe_context():
+    """
+    Check if current context allows ID modifications (driver setup).
+
+    Safe contexts: UI callbacks (update functions), operator execute(), on_load_post()
+    Unsafe contexts: frame_change_post, depsgraph_update_post, timer callbacks during playback
+
+    Returns True if driver setup can be attempted, False otherwise.
+    """
+    try:
+        # During playback, handlers run in restricted contexts
+        # Timer callbacks during playback are also restricted
+        if bpy.context.screen and bpy.context.screen.is_animation_playing:
+            return False
+    except (AttributeError, RuntimeError):
+        # Context unavailable = likely in restricted handler
+        return False
+    return True
+
+
+def is_driver_setup_pending():
+    """Check if driver setup is waiting for a safe context."""
+    return _driver_setup_pending
+
+
+def complete_pending_driver_setup(gp_obj):
+    """
+    Complete pending driver setup. Call from safe context only.
+
+    Returns True if driver was set up, False if nothing was pending or context unsafe.
+    """
+    global _driver_setup_pending
+    if not _driver_setup_pending:
+        return False
+    if not _is_safe_context():
+        return False
+    if gp_obj is None:
+        return False
+
+    _setup_shrinkwrap_driver(gp_obj)
+    _driver_setup_pending = False
+    log("Completed pending driver setup", "BAKE")
+    return True
+
+
 # ============================================================================
 # v8.1: DRIVER NAMESPACE OFFSET SYSTEM
 # Uses bpy.app.driver_namespace to register a lookup function.
@@ -148,52 +199,99 @@ def _setup_shrinkwrap_driver(gp_obj):
 
     The driver expression 'shrinkwrap_offset(frame)' calls our registered
     function which looks up the offset from our baked dict.
-    """
-    def _do_setup():
-        """Inner function to do the actual driver setup."""
-        # Remove existing driver if present (avoid duplicates)
-        try:
-            gp_obj.driver_remove("delta_location", 2)  # index 2 = Z
-        except:
-            pass  # No driver existed
 
-        # Ensure namespace function is registered
+    v9.3: This function should ONLY be called from safe contexts.
+    Context safety is checked by the caller (bake_shrinkwrap_offsets or
+    complete_pending_driver_setup). No deferred timer - we use pending flag instead.
+    """
+    # Remove existing driver if present (avoid duplicates)
+    try:
+        gp_obj.driver_remove("delta_location", 2)  # index 2 = Z
+    except:
+        pass  # No driver existed
+
+    # NOTE: Namespace function should be registered at addon load time
+    # (in __init__.py register()), not here. But ensure it exists as safety.
+    if "shrinkwrap_offset" not in bpy.app.driver_namespace:
         register_driver_namespace()
 
-        # Add new driver
-        fcurve = gp_obj.driver_add("delta_location", 2)
-        driver = fcurve.driver
-        driver.type = 'SCRIPTED'
+    # Add new driver
+    fcurve = gp_obj.driver_add("delta_location", 2)
+    driver = fcurve.driver
+    driver.type = 'SCRIPTED'
 
-        # Add frame variable that reads current frame from scene
-        var = driver.variables.new()
-        var.name = "frame"
-        var.type = 'SINGLE_PROP'
-        var.targets[0].id_type = 'SCENE'
-        var.targets[0].id = bpy.context.scene
-        var.targets[0].data_path = "frame_current"
+    # Add frame variable that reads current frame from scene
+    var = driver.variables.new()
+    var.name = "frame"
+    var.type = 'SINGLE_PROP'
+    var.targets[0].id_type = 'SCENE'
+    var.targets[0].id = bpy.context.scene
+    var.targets[0].data_path = "frame_current"
 
-        # Expression calls our registered namespace function
-        driver.expression = "shrinkwrap_offset(frame)"
+    # Expression calls our registered namespace function
+    driver.expression = "shrinkwrap_offset(frame)"
 
-        log("Setup driver on delta_location.z using namespace function", "BAKE")
+    log("Setup driver on delta_location.z using namespace function", "BAKE")
 
-    # Try direct setup first
-    try:
-        _do_setup()
-    except AttributeError as e:
-        if "Writing to ID classes" in str(e):
-            # Context doesn't allow ID modifications - defer to timer
-            log("Driver setup deferred to timer (context restriction)", "BAKE")
-            def _deferred_setup():
-                try:
-                    _do_setup()
-                except Exception as ex:
-                    log(f"Deferred driver setup failed: {ex}", "ERROR")
-                return None  # Don't repeat
-            bpy.app.timers.register(_deferred_setup, first_interval=0.1)
-        else:
-            raise  # Re-raise unexpected errors
+
+def _has_shrinkwrap_driver(gp_obj):
+    """
+    Check if shrinkwrap driver exists on delta_location.z.
+    Returns True if driver is present, False otherwise.
+    """
+    if gp_obj is None:
+        return False
+    if gp_obj.animation_data is None:
+        return False
+    for fc in gp_obj.animation_data.drivers:
+        if fc.data_path == "delta_location" and fc.array_index == 2:
+            return True
+    return False
+
+
+def ensure_shrinkwrap_valid(gp_obj, settings, scene):
+    """
+    Validate shrinkwrap data state. Called from frame_change handler.
+
+    v9.3: This function does NOT attempt driver setup from handlers because
+    handlers run in restricted contexts where ID modifications fail.
+    Driver setup is handled separately from safe contexts (UI callbacks,
+    operators, file load).
+
+    This function only validates and fixes:
+      - _baked_shrinkwrap_offsets dict (populated)
+      - _baked_offset_valid flag (True)
+      - Namespace function (registered)
+
+    Driver existence is NOT validated here - driver setup happens from:
+      - settings.update_realtime() when user enables shrinkwrap
+      - __init__.on_load_post() after file load
+      - operators.cursor_sync modal when playback stops
+
+    Returns True if shrinkwrap DATA is valid, False otherwise.
+    """
+    if not settings.depth_interaction_enabled:
+        return False
+
+    if gp_obj is None:
+        return False
+
+    # Check data components (NOT driver - can't fix from handler)
+    bake_valid = is_bake_valid()
+    namespace_valid = "shrinkwrap_offset" in bpy.app.driver_namespace
+
+    # If data components are valid, nothing to do - early exit (cheap path)
+    if bake_valid and namespace_valid:
+        return True
+
+    # Data invalid - re-bake WITHOUT driver setup (we're in handler context)
+    log(f"Shrinkwrap data validation: bake={bake_valid} namespace={namespace_valid} - re-baking", "BAKE")
+    bake_shrinkwrap_offsets(gp_obj, settings, scene, setup_driver=False)
+
+    # NOTE: No scene.frame_set() here - we're already in frame_change handler.
+    # Calling frame_set would cause recursion.
+
+    return is_bake_valid()
 
 
 def remove_shrinkwrap_driver(gp_obj):
@@ -217,96 +315,134 @@ def remove_shrinkwrap_driver(gp_obj):
         pass
 
 
-def bake_shrinkwrap_offsets(gp_obj, settings, scene):
+def bake_shrinkwrap_offsets(gp_obj, settings, scene, setup_driver=True):
     """
     Pre-compute shrinkwrap Z offsets for ENTIRE animation range.
 
     Called when shrinkwrap is enabled or animation changes.
-    MUST be called from a context where raycast is reliable (not during playback).
 
-    This eliminates runtime raycast dependency - during playback we just
-    read from this lookup table.
+    Args:
+        gp_obj: The Grease Pencil object
+        settings: WorldOnionSettings
+        scene: The scene
+        setup_driver: If True, attempt driver setup (only succeeds in safe context).
+                      Pass False when calling from handlers to avoid context errors.
+
+    v9.3: Driver setup is now context-aware. If setup_driver=True but context is
+    unsafe, driver setup is marked as pending and will be completed from the
+    next safe context (UI callback, operator, or when playback stops).
     """
-    global _baked_shrinkwrap_offsets, _baked_offset_valid
+    global _baked_shrinkwrap_offsets, _baked_offset_valid, _bake_in_progress, _driver_setup_pending
 
-    _baked_shrinkwrap_offsets = {}
-    _baked_offset_valid = False
-
-    if not gp_obj:
+    # Guard against overlapping bakes (can happen with nested handler calls)
+    if _bake_in_progress:
+        log("Bake already in progress, skipping", "BAKE")
         return 0
 
-    if not gp_obj.animation_data or not gp_obj.animation_data.action:
-        # No animation - just compute current frame offset
-        offset = _compute_single_frame_offset(gp_obj, scene, scene.frame_current)
-        if offset is not None:
-            _baked_shrinkwrap_offsets[scene.frame_current] = offset
-            _baked_offset_valid = True
-        return 1
-
-    # Get frame range from animation
-    start_frame = int(gp_obj.animation_data.action.frame_range[0])
-    end_frame = int(gp_obj.animation_data.action.frame_range[1])
-
-    # Get location F-curves for evaluation
-    fcurves = gp_obj.animation_data.action.fcurves
-    fc_x = fcurves.find('location', index=0)
-    fc_y = fcurves.find('location', index=1)
-    fc_z = fcurves.find('location', index=2)
-
-    if not fc_x or not fc_y or not fc_z:
-        return 0
+    _bake_in_progress = True
 
     try:
-        depsgraph = bpy.context.evaluated_depsgraph_get()
-    except (RuntimeError, AttributeError):
-        return 0
+        _baked_shrinkwrap_offsets = {}
+        _baked_offset_valid = False
 
-    count = 0
-    for frame in range(start_frame, end_frame + 1):
-        # Evaluate F-curve position
-        x = fc_x.evaluate(frame)
-        y = fc_y.evaluate(frame)
-        z = fc_z.evaluate(frame)
+        if not gp_obj:
+            return 0
 
-        # Raycast down to find mesh surface
-        ray_origin = Vector((x, y, z + 1000.0))
-        ray_dir = Vector((0, 0, -1))
+        if not gp_obj.animation_data or not gp_obj.animation_data.action:
+            # No animation - just compute current frame offset
+            offset = _compute_single_frame_offset(gp_obj, scene, scene.frame_current)
+            if offset is not None:
+                _baked_shrinkwrap_offsets[scene.frame_current] = offset
+                _baked_offset_valid = True
+            # Still need driver setup for single-frame case
+            if setup_driver:
+                _handle_driver_setup(gp_obj)
+            return 1
+
+        # Get frame range from animation
+        start_frame = int(gp_obj.animation_data.action.frame_range[0])
+        end_frame = int(gp_obj.animation_data.action.frame_range[1])
+
+        # Get location F-curves for evaluation
+        fcurves = gp_obj.animation_data.action.fcurves
+        fc_x = fcurves.find('location', index=0)
+        fc_y = fcurves.find('location', index=1)
+        fc_z = fcurves.find('location', index=2)
+
+        if not fc_x or not fc_y or not fc_z:
+            return 0
 
         try:
-            hit, location, normal, index, hit_obj, matrix = scene.ray_cast(
-                depsgraph, ray_origin, ray_dir
-            )
-
-            if hit and hit_obj != gp_obj:
-                # Offset = mesh_z - fcurve_z + small surface offset
-                offset = (location.z + SURFACE_OFFSET) - z
-                _baked_shrinkwrap_offsets[frame] = offset
-            else:
-                # No mesh below - zero offset
-                _baked_shrinkwrap_offsets[frame] = 0.0
+            depsgraph = bpy.context.evaluated_depsgraph_get()
         except (RuntimeError, AttributeError):
-            _baked_shrinkwrap_offsets[frame] = 0.0
+            return 0
 
-        count += 1
+        count = 0
+        for frame in range(start_frame, end_frame + 1):
+            # Evaluate F-curve position
+            x = fc_x.evaluate(frame)
+            y = fc_y.evaluate(frame)
+            z = fc_z.evaluate(frame)
 
-    _baked_offset_valid = True
+            # Raycast down to find mesh surface
+            ray_origin = Vector((x, y, z + 1000.0))
+            ray_dir = Vector((0, 0, -1))
 
-    # Also invalidate motion path so it rebuilds with baked offsets
-    invalidate_motion_path()
+            try:
+                hit, location, normal, index, hit_obj, matrix = scene.ray_cast(
+                    depsgraph, ray_origin, ray_dir
+                )
 
-    # DEBUG: Log bake results
-    if _baked_shrinkwrap_offsets:
-        offsets = list(_baked_shrinkwrap_offsets.values())
-        offset_range = f"min={min(offsets):.4f} max={max(offsets):.4f}"
+                if hit and hit_obj != gp_obj:
+                    # Offset = mesh_z - fcurve_z + small surface offset
+                    offset = (location.z + SURFACE_OFFSET) - z
+                    _baked_shrinkwrap_offsets[frame] = offset
+                else:
+                    # No mesh below - zero offset
+                    _baked_shrinkwrap_offsets[frame] = 0.0
+            except (RuntimeError, AttributeError):
+                _baked_shrinkwrap_offsets[frame] = 0.0
+
+            count += 1
+
+        _baked_offset_valid = True
+
+        # Also invalidate motion path so it rebuilds with baked offsets
+        invalidate_motion_path()
+
+        # DEBUG: Log bake results
+        if _baked_shrinkwrap_offsets:
+            offsets = list(_baked_shrinkwrap_offsets.values())
+            offset_range = f"min={min(offsets):.4f} max={max(offsets):.4f}"
+        else:
+            offset_range = "empty"
+        log_bake(count, offset_range)
+
+        # v9.3: Context-aware driver setup
+        if setup_driver:
+            _handle_driver_setup(gp_obj)
+
+        return count
+
+    finally:
+        _bake_in_progress = False
+
+
+def _handle_driver_setup(gp_obj):
+    """
+    Handle driver setup with context awareness.
+    If context is safe, set up driver immediately.
+    If context is unsafe, mark as pending for later completion.
+    """
+    global _driver_setup_pending
+
+    if _is_safe_context():
+        _setup_shrinkwrap_driver(gp_obj)
+        _driver_setup_pending = False
     else:
-        offset_range = "empty"
-    log_bake(count, offset_range)
-
-    # v8.1: Setup driver that calls our namespace function
-    # NO KEYFRAMES - just stores in dict and driver looks it up!
-    _setup_shrinkwrap_driver(gp_obj)
-
-    return count
+        # Mark as pending - will be completed from next safe context
+        _driver_setup_pending = True
+        log("Driver setup marked as pending (unsafe context)", "BAKE")
 
 
 def _compute_single_frame_offset(gp_obj, scene, frame):

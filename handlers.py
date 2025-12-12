@@ -91,6 +91,14 @@ def on_frame_change(scene):
     # Ensure billboard constraint is active
     ensure_billboard_constraint(gp_obj, scene)
 
+    # === SHRINKWRAP VALIDATION ===
+    # Single point of truth - if shrinkwrap is enabled, ensure all components are valid.
+    # This catches ALL scenarios: enable toggle, file load, GP switch, addon reload, etc.
+    # Cheap when already valid (just boolean checks), fixes automatically when not.
+    if settings.depth_interaction_enabled:
+        from .drawing import ensure_shrinkwrap_valid
+        ensure_shrinkwrap_valid(gp_obj, settings, scene)
+
     # === v8: DRIVER HANDLES OFFSET AUTOMATICALLY ===
     # The driver on delta_location.z reads from the animated custom property
     # "_shrinkwrap_z_offset" which was baked during the bake operation.
@@ -108,20 +116,10 @@ def on_frame_change(scene):
         # Update keyframe tracking set on frame change
         _last_keyframe_set = get_current_keyframes_set(gp_obj, settings)
 
-        # v8.5.2: Hybrid cursor sync - handler catches frames missed by modal
-        # Only update if modal hasn't already handled this frame (prevents jitter)
-        if settings.anchor_auto_cursor:
-            from .operators import get_last_cursor_synced_frame, set_last_cursor_synced_frame
-            current_frame = scene.frame_current
-            if current_frame != get_last_cursor_synced_frame():
-                try:
-                    depsgraph = bpy.context.evaluated_depsgraph_get()
-                    gp_obj_eval = gp_obj.evaluated_get(depsgraph)
-                    scene.cursor.location = gp_obj_eval.matrix_world.translation
-                    set_last_cursor_synced_frame(current_frame)
-                    log(f"HANDLER_CURSOR frame={current_frame}", "CURSOR")
-                except (RuntimeError, AttributeError):
-                    pass  # Context unavailable
+        # NOTE: Cursor sync is handled ONLY by the modal operator (WONION_OT_cursor_sync)
+        # The modal has sophisticated playback/scrub detection and only syncs cursor
+        # when stationary. Handler-based sync was causing race conditions where
+        # cursor would animate during playback (inconsistent, performance cost).
 
     # === MOTION PATH ===
     # NOTE: Motion path invalidation REMOVED from frame change handler.
@@ -216,6 +214,17 @@ def _on_depsgraph_update_impl(scene, depsgraph):
         invalidate_onion_batch_cache()
         # Force viewport redraw for immediate feedback
         _tag_viewport_redraw()
+
+        # Re-bake shrinkwrap when animation changes (keyframes added/deleted/moved)
+        # Unlike motion path (lazy rebuild), shrinkwrap uses pre-baked dictionary
+        # that the driver reads, so stale data persists without explicit re-bake
+        # v9.3: Use setup_driver=False since we're in handler context (restricted)
+        if animation_changed and settings.depth_interaction_enabled:
+            from .drawing import bake_shrinkwrap_offsets
+            bake_shrinkwrap_offsets(gp_obj, settings, scene, setup_driver=False)
+            # NOTE: No scene.frame_set() here - it can cause recursive handler calls
+            # and we're already in a handler context. Driver will pick up new baked
+            # values on the next frame naturally.
 
     # Detect keyframe changes
     if gp_data_changed and _last_keyframe_set:

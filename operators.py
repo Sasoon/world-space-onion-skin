@@ -19,7 +19,7 @@ from .anchors import (
     get_visible_keyframe,
 )
 from .transforms import get_layer_transform, get_camera_direction, align_canvas_to_cursor, ensure_billboard_constraint, align_strokes_to_camera
-from .drawing import invalidate_motion_path, get_baked_offset
+from .drawing import invalidate_motion_path, get_baked_offset, is_driver_setup_pending, complete_pending_driver_setup
 from .debug_log import log
 
 # v8.5: Track if cursor sync modal is running
@@ -122,6 +122,14 @@ class WONION_OT_cursor_sync(bpy.types.Operator):
                             log(f"MODAL_CURSOR_ON_STOP frame={current_frame}", "CURSOR")
                         except Exception as e:
                             log(f"MODAL_CURSOR_ON_STOP FAILED: {e}", "ERROR")
+
+                # v9.3: Complete pending driver setup now that playback stopped
+                # This is a safe context - modal callbacks can modify ID data
+                if settings.depth_interaction_enabled and is_driver_setup_pending():
+                    gp_obj = get_active_gp(context)
+                    if gp_obj:
+                        if complete_pending_driver_setup(gp_obj):
+                            log("Completed pending shrinkwrap driver (playback stopped)", "BAKE")
 
                 self._show_canvas(context)
                 self._last_frame_time = None  # Reset for next scrub detection

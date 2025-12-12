@@ -9,7 +9,7 @@ from .drawing import (
     register_draw_handlers, unregister_draw_handlers,
     bake_shrinkwrap_offsets, invalidate_baked_offsets,
     invalidate_motion_path, remove_shrinkwrap_driver,
-    invalidate_onion_batch_cache,
+    invalidate_onion_batch_cache, complete_pending_driver_setup,
 )
 from .anchors import get_current_keyframes_set
 from .handlers import set_last_keyframe_set, set_last_active_layer_name
@@ -91,11 +91,15 @@ def update_realtime(self, context):
 
     # Auto-bake shrinkwrap offsets when shrinkwrap is enabled
     # This ensures we have baked data before playback starts
-    # v8: bake_shrinkwrap_offsets also sets up the driver on delta_location.z
+    # v9.3: UI callback is a safe context - driver setup will succeed here
     if self.depth_interaction_enabled:
         gp_obj = get_active_gp(context)
         if gp_obj:
-            bake_shrinkwrap_offsets(gp_obj, self, context.scene)
+            # Bake with setup_driver=True (default) - safe context allows it
+            bake_shrinkwrap_offsets(gp_obj, self, context.scene, setup_driver=True)
+            # Also complete any pending driver setup from previous attempts
+            # (e.g., if user enabled shrinkwrap during playback, stopped, then adjusted settings)
+            complete_pending_driver_setup(gp_obj)
     else:
         # Shrinkwrap disabled - invalidate baked data and remove driver
         invalidate_baked_offsets()
