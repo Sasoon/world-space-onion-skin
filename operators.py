@@ -273,21 +273,29 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
                                             If False, ALL strokes are compensated to stay in world space.
     """
     current_frame = scene.frame_current
-    
+
+    log("=" * 60, "SNAP")
+    log(f"SET_ANCHOR_LOGIC START frame={current_frame}", "SNAP")
+    log(f"  target_world_pos={target_world_pos[:]}", "SNAP")
+    log(f"  move_selected_strokes_to_target={move_selected_strokes_to_target}", "SNAP")
+
     # Get current object location (old anchor)
     old_location = gp_obj.location.copy()
-    
+    log(f"  old_location={old_location[:]}", "SNAP")
+
     active_layer = gp_obj.data.layers.active
     if active_layer is None:
+        log("  CANCELLED: no active layer", "SNAP")
         return {'CANCELLED'}
 
     # Find active keyframe
     active_kf = None
+    keyframe_copied = False  # Track if we copied a keyframe (held frame case)
     for kf in active_layer.frames:
         if kf.frame_number == current_frame:
             active_kf = kf
             break
-    
+
     if active_kf is None:
         # Find visible
         visible_kf = None
@@ -295,21 +303,41 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
             if kf.frame_number <= current_frame:
                 if visible_kf is None or kf.frame_number > visible_kf.frame_number:
                     visible_kf = kf
-        
+
         if visible_kf:
             # Create new keyframe at current frame
+            log(f"  Copying visible keyframe from {visible_kf.frame_number} to {current_frame}", "SNAP")
             active_kf = active_layer.frames.copy(visible_kf.frame_number, current_frame)
+            keyframe_copied = True  # Mark that we copied a keyframe
         else:
+            log("  CANCELLED: no visible keyframe", "SNAP")
             return {'CANCELLED'}
+
+    log(f"  active_kf.frame_number={active_kf.frame_number}", "SNAP")
+    log(f"  keyframe_copied={keyframe_copied}", "SNAP")
 
     # Ensure billboard constraint exists (so matrix_world is correct)
     constraint_modified = ensure_billboard_constraint(gp_obj, scene)
+    log(f"  constraint_modified={constraint_modified}", "SNAP")
 
-    # If constraint was newly created/modified, force complete depsgraph rebuild
-    # view_layer.update() alone isn't enough - new constraints need full re-evaluation
-    if constraint_modified:
+    # CRITICAL FIX for held frames: If we copied a keyframe and shrinkwrap is enabled,
+    # we must bake offsets NOW before getting matrix_world_old.
+    # Otherwise the driver has no bake data for this new frame and uses wrong offset.
+    settings = scene.world_onion
+    if keyframe_copied and settings.depth_interaction_enabled:
+        log("  Baking shrinkwrap BEFORE matrix capture (held frame fix)", "SNAP")
+        from .drawing import bake_shrinkwrap_offsets
+        bake_shrinkwrap_offsets(gp_obj, settings, scene)
+
+    # Force frame_set if constraint modified OR keyframe was copied (held frame case)
+    # view_layer.update() alone isn't enough:
+    # - New constraints need full re-evaluation
+    # - Copied keyframes need shrinkwrap driver to re-evaluate for new frame
+    if constraint_modified or keyframe_copied:
+        log(f"  Forcing frame_set (constraint={constraint_modified}, keyframe_copied={keyframe_copied})", "SNAP")
         scene.frame_set(scene.frame_current)
     else:
+        log("  Using view_layer.update()", "SNAP")
         context.view_layer.update()
 
     # Get evaluated matrix (with constraints fully applied)
@@ -317,11 +345,20 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
         depsgraph = context.evaluated_depsgraph_get()
         gp_obj_eval = gp_obj.evaluated_get(depsgraph)
         matrix_world_old = gp_obj_eval.matrix_world.copy()
-    except (RuntimeError, AttributeError):
+        log("  Got matrix_world_old from EVALUATED object", "SNAP")
+    except (RuntimeError, AttributeError) as e:
         # Fallback to raw matrix if depsgraph unavailable
         matrix_world_old = gp_obj.matrix_world.copy()
+        log(f"  FALLBACK matrix_world_old from raw object: {e}", "SNAP")
+
     layer_matrix = get_layer_transform(active_layer)
     full_matrix_old = matrix_world_old @ layer_matrix
+
+    # Log matrix details
+    log(f"  matrix_world_old.translation={matrix_world_old.translation[:]}", "SNAP")
+    log(f"  matrix_world_old rotation (euler)={matrix_world_old.to_euler()[:]}", "SNAP")
+    log(f"  layer_matrix.translation={layer_matrix.translation[:]}", "SNAP")
+    log(f"  full_matrix_old.translation={full_matrix_old.translation[:]}", "SNAP")
 
     # Store world positions (using full transform: object + layer)
     stroke_points = []
@@ -332,16 +369,35 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
             world_pos = full_matrix_old @ Vector(p.position)
             points.append(world_pos)
         stroke_points.append(points)
-        
+
+    # Log sample stroke data
+    if stroke_points and stroke_points[0]:
+        first_local = Vector(drawing.strokes[0].points[0].position)
+        first_world = stroke_points[0][0]
+        log(f"  SAMPLE stroke[0][0] local={first_local[:]}", "SNAP")
+        log(f"  SAMPLE stroke[0][0] world={first_world[:]}", "SNAP")
+
     # Move Object
+    log(f"  MOVING object to {target_world_pos[:]}", "SNAP")
     gp_obj.location = target_world_pos
 
     # Insert Keyframe for Location
     gp_obj.keyframe_insert(data_path="location", frame=current_frame)
+    log(f"  Inserted location keyframe at frame {current_frame}", "SNAP")
+
+    # CRITICAL FIX: Re-bake shrinkwrap AFTER inserting keyframe at new position.
+    # The early bake calculated offset for the OLD position. Now that we've inserted
+    # a keyframe at the NEW position, we must re-bake so matrix_world_new has the
+    # correct offset that matches what will be displayed after the operator completes.
+    if settings.depth_interaction_enabled:
+        log("  Re-baking shrinkwrap AFTER keyframe insert (position changed)", "SNAP")
+        from .drawing import bake_shrinkwrap_offsets
+        bake_shrinkwrap_offsets(gp_obj, settings, scene)
 
     # CRITICAL: Use scene.frame_set() to force complete depsgraph rebuild
     # view_layer.update() alone doesn't re-evaluate billboard constraint rotation
     # after position change. The constraint needs to recalculate the angle to camera.
+    log("  Forcing frame_set AFTER move for constraint update", "SNAP")
     scene.frame_set(scene.frame_current)
 
     # Get evaluated matrix (with constraints fully applied after frame_set)
@@ -349,13 +405,29 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
         depsgraph = context.evaluated_depsgraph_get()
         gp_obj_eval = gp_obj.evaluated_get(depsgraph)
         matrix_world_new = gp_obj_eval.matrix_world.copy()
-    except (RuntimeError, AttributeError):
+        log("  Got matrix_world_new from EVALUATED object", "SNAP")
+    except (RuntimeError, AttributeError) as e:
         matrix_world_new = gp_obj.matrix_world.copy()
+        log(f"  FALLBACK matrix_world_new from raw object: {e}", "SNAP")
+
     # Use full matrix (object + layer) for transforming back to local space
     full_matrix_new = matrix_world_new @ layer_matrix
     full_matrix_new_inv = full_matrix_new.inverted()
 
+    # Log new matrix details
+    log(f"  matrix_world_new.translation={matrix_world_new.translation[:]}", "SNAP")
+    log(f"  matrix_world_new rotation (euler)={matrix_world_new.to_euler()[:]}", "SNAP")
+    log(f"  full_matrix_new.translation={full_matrix_new.translation[:]}", "SNAP")
+
+    # Check if rotations match (they should for billboard)
+    rot_old = matrix_world_old.to_euler()
+    rot_new = matrix_world_new.to_euler()
+    rot_diff = Vector((rot_new.x - rot_old.x, rot_new.y - rot_old.y, rot_new.z - rot_old.z))
+    log(f"  ROTATION DIFF (new-old)={rot_diff[:]}", "SNAP")
+
     # Transform strokes back to local space relative to new object position
+    log(f"  TRANSFORM STROKES BACK (move_selected={move_selected_strokes_to_target})", "SNAP")
+
     if move_selected_strokes_to_target:
         # GROUPED centering: collect all points from ALL selected strokes
         all_selected_world_points = []
@@ -365,6 +437,8 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
             if stroke.select:
                 selected_stroke_indices.append(i)
                 all_selected_world_points.extend(stroke_points[i])
+
+        log(f"  Selected strokes: {len(selected_stroke_indices)}, points: {len(all_selected_world_points)}", "SNAP")
 
         if all_selected_world_points:
             # Compute single bottom-center for the entire group (center XY, lowest Z)
@@ -376,6 +450,9 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
 
             # Single offset applied to all selected strokes as a group
             offset = target_world_pos - group_bottom_center
+
+            log(f"  group_bottom_center={group_bottom_center[:]}", "SNAP")
+            log(f"  offset={offset[:]}", "SNAP")
 
             # Apply offset to selected strokes (and optionally align to view)
             settings = scene.world_onion
@@ -392,6 +469,14 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
                     new_local = full_matrix_new_inv @ new_world
                     drawing.strokes[i].points[j].position = new_local
 
+            # Log sample result after transform
+            if selected_stroke_indices:
+                sample_i = selected_stroke_indices[0]
+                sample_local = Vector(drawing.strokes[sample_i].points[0].position)
+                sample_world_check = full_matrix_new @ sample_local
+                log(f"  AFTER: stroke[{sample_i}][0] local={sample_local[:]}", "SNAP")
+                log(f"  AFTER: stroke[{sample_i}][0] world_check={sample_world_check[:]}", "SNAP")
+
             # Preserve world position for non-selected strokes
             for i, stroke in enumerate(drawing.strokes):
                 if i not in selected_stroke_indices:
@@ -399,6 +484,7 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
                         new_local = full_matrix_new_inv @ p_world
                         stroke.points[j].position = new_local
         else:
+            log("  No selected strokes - preserving all world positions", "SNAP")
             # No selected strokes - preserve all world positions
             for i, stroke in enumerate(drawing.strokes):
                 for j, p_world in enumerate(stroke_points[i]):
@@ -419,15 +505,33 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
                 new_local = full_matrix_new_inv @ p_world
                 stroke.points[j].position = new_local
 
+        # Log sample result
+        if stroke_points and stroke_points[0]:
+            sample_local = Vector(drawing.strokes[0].points[0].position)
+            sample_world_check = full_matrix_new @ sample_local
+            log(f"  AFTER: stroke[0][0] local={sample_local[:]}", "SNAP")
+            log(f"  AFTER: stroke[0][0] world_check={sample_world_check[:]}", "SNAP")
+
     # Explicitly invalidate motion path and onion cache, then request redraw
     invalidate_motion_path()
     # Also invalidate onion GPU batch cache since stroke local positions changed
     from .drawing import invalidate_onion_batch_cache
     invalidate_onion_batch_cache()
+
+    # CRITICAL FIX: Re-cache current frame AFTER stroke transforms
+    # The frame_set() call earlier triggered cache_current_frame() with OLD stroke positions.
+    # We must re-cache now that strokes have been transformed to new positions.
+    from .cache import cache_current_frame
+    settings = scene.world_onion
+    cache_current_frame(gp_obj, settings)
+    log("  Re-cached current frame after stroke transform", "SNAP")
+
     for area in context.screen.areas:
         if area.type == 'VIEW_3D':
             area.tag_redraw()
 
+    log("SET_ANCHOR_LOGIC END - FINISHED", "SNAP")
+    log("=" * 60, "SNAP")
     return {'FINISHED'}
 
 

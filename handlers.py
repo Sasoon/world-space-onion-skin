@@ -269,25 +269,48 @@ def on_load_post(dummy):
     clear_cache()
 
 
+@persistent
+def on_undo_post(scene):
+    """Clear caches when user performs undo - ensures visual state matches data.
+
+    This is critical for snap operators which use scene.frame_set() during execution.
+    frame_set() triggers cache updates mid-operator, so on undo the stroke DATA is
+    restored but cached onion skin data still has old positions. Clearing caches
+    here forces them to rebuild from the restored (undone) data.
+    """
+    clear_cache()
+    invalidate_motion_path()
+    from .drawing import invalidate_onion_batch_cache
+    invalidate_onion_batch_cache()
+    _tag_viewport_redraw()
+    log("UNDO detected - cleared all caches", "INFO")
+
+
 def register_handlers():
     """Register all handlers."""
     if on_frame_change not in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.append(on_frame_change)
-    
+
     if on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(on_depsgraph_update)
-    
+
     if on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(on_load_post)
+
+    if on_undo_post not in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.append(on_undo_post)
 
 
 def unregister_handlers():
     """Unregister all handlers."""
     if on_frame_change in bpy.app.handlers.frame_change_post:
         bpy.app.handlers.frame_change_post.remove(on_frame_change)
-    
+
     if on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(on_depsgraph_update)
-    
+
     if on_load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(on_load_post)
+
+    if on_undo_post in bpy.app.handlers.undo_post:
+        bpy.app.handlers.undo_post.remove(on_undo_post)
