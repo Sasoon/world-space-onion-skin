@@ -3,15 +3,18 @@ GPU drawing callbacks for onion skin and anchor visualization.
 """
 
 import bisect
+import math
 
+import blf
 import bpy
 import gpu
+from bpy_extras.view3d_utils import location_3d_to_region_2d
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 
 from .cache import get_cache, get_active_gp
 from .anchors import get_all_anchor_positions
-from .transforms import SURFACE_OFFSET, catmull_rom_point, adjust_obj_to_surface
+from .transforms import SURFACE_OFFSET, adjust_obj_to_surface
 from .debug_log import log, log_onion_draw, log_bake, log_cursor
 
 
@@ -28,6 +31,16 @@ _motion_path_dirty = True
 _motion_path_coords = None  # Pre-built tuple coords for GPU
 _motion_path_line_batch = None
 _motion_path_point_batch = None
+
+# Motion path visualization enhancements
+_motion_path_spacing_dots_batch = None  # GPU batch for arc-length spacing dots (DEPRECATED - see below)
+_motion_path_arrows_batch = None  # GPU batch for direction arrows (triangles)
+_motion_path_keyframe_data = None  # [(world_pos, frame_num, tangent), ...] for arrows/labels
+_motion_path_labels_handler = None  # POST_PIXEL handler for frame number labels
+
+# Timing chart batches - keyframes are circles, inbetweens are ticks
+_motion_path_keyframe_circles_batch = None  # Filled circles at keyframe positions (TRIS)
+_motion_path_inbetween_ticks_batch = None  # Perpendicular tick marks for inbetween frames (LINES)
 
 # Baked shrinkwrap offsets - computed ONCE when shrinkwrap enabled or animation changes
 # Structure: {frame: z_offset}  - stores the Z offset from raycast
@@ -85,11 +98,20 @@ def _get_fill_shader():
 def invalidate_motion_path():
     """Mark motion path cache as dirty, triggering rebuild on next draw."""
     global _motion_path_dirty, _motion_path_line_batch, _motion_path_point_batch, _motion_path_coords
+    global _motion_path_spacing_dots_batch, _motion_path_arrows_batch, _motion_path_keyframe_data
+    global _motion_path_keyframe_circles_batch, _motion_path_inbetween_ticks_batch
     _motion_path_dirty = True
     # Also invalidate GPU batch cache
     _motion_path_line_batch = None
     _motion_path_point_batch = None
     _motion_path_coords = None
+    # Invalidate visualization enhancement batches
+    _motion_path_spacing_dots_batch = None
+    _motion_path_arrows_batch = None
+    _motion_path_keyframe_data = None
+    # Invalidate timing chart batches (keyframe circles + inbetween ticks)
+    _motion_path_keyframe_circles_batch = None
+    _motion_path_inbetween_ticks_batch = None
 
 
 def invalidate_onion_batch_cache():
@@ -431,7 +453,8 @@ def bake_shrinkwrap_offsets(gp_obj, settings, scene, setup_driver=True):
 
                 if hit and hit_obj != gp_obj:
                     # Offset = mesh_z - fcurve_z + small surface offset
-                    offset = (location.z + SURFACE_OFFSET) - z
+                    # Minimum Z mode: only push UP, never down (preserves jump animations)
+                    offset = max(0, (location.z + SURFACE_OFFSET) - z)
                     _baked_shrinkwrap_offsets[frame] = offset
                 else:
                     # No mesh below - zero offset
@@ -533,6 +556,187 @@ def adjust_path_points_to_mesh(points, scene):
             adjusted_points.append(pt)
 
     return adjusted_points
+
+
+# ============================================================================
+# MOTION PATH VISUALIZATION HELPERS
+# ============================================================================
+
+def _build_spacing_dots(coords, count):
+    """
+    Build arc-length parameterized spacing tick marks along the motion path.
+
+    This creates tick marks at uniform arc-length intervals, which naturally
+    results in dense ticks where the object moves slowly and sparse ticks
+    where it moves fast - like a traditional animation timing chart.
+
+    Args:
+        coords: List of (x, y, z) tuples representing the path
+        count: Number of ticks to place along the path
+
+    Returns:
+        List of (position, tangent) tuples where:
+        - position: Vector of tick center
+        - tangent: Vector of path direction at that point (for perpendicular calc)
+    """
+    if len(coords) < 2 or count < 1:
+        return []
+
+    # 1. Compute cumulative arc length
+    distances = []
+    cumulative = [0.0]
+
+    for i in range(1, len(coords)):
+        p0 = Vector(coords[i - 1])
+        p1 = Vector(coords[i])
+        dist = (p1 - p0).length
+        distances.append(dist)
+        cumulative.append(cumulative[-1] + dist)
+
+    total_length = cumulative[-1]
+    if total_length < 0.0001:
+        return []
+
+    # 2. Place ticks at uniform arc-length intervals
+    step = total_length / count
+    ticks = []
+
+    for i in range(count + 1):
+        target_dist = i * step
+
+        # Find segment containing this arc length using binary search
+        j = bisect.bisect_right(cumulative, target_dist)
+        if j >= len(cumulative):
+            j = len(cumulative) - 1
+        if j < 1:
+            j = 1
+
+        # Interpolate within segment
+        seg_start = cumulative[j - 1]
+        seg_len = distances[j - 1] if j - 1 < len(distances) else 0.0001
+
+        if seg_len > 0.0001:
+            t = (target_dist - seg_start) / seg_len
+            t = max(0.0, min(1.0, t))
+
+            p0 = Vector(coords[j - 1])
+            p1 = Vector(coords[j]) if j < len(coords) else p0
+            tick_pos = p0.lerp(p1, t)
+
+            # Tangent is the direction of this segment
+            tangent = (p1 - p0).normalized()
+
+            ticks.append((tick_pos, tangent))
+
+    return ticks
+
+
+def _build_arrow_geometry(keyframe_data, size):
+    """
+    Build V/chevron geometry for a single direction arrow at end of path.
+
+    Only draws one arrow at the last keyframe position, pointing in
+    direction of travel. The motion path direction is clear from this
+    single indicator.
+
+    Args:
+        keyframe_data: List of (world_pos, frame_num, tangent) tuples
+        size: Size of arrow in world units
+
+    Returns:
+        List of (x, y, z) tuples for line vertices (4 vertices - 2 lines)
+    """
+    if not keyframe_data:
+        return []
+
+    # Only use the LAST keyframe (end of path)
+    world_pos, frame_num, tangent = keyframe_data[-1]
+
+    if tangent.length < 0.0001:
+        return []
+
+    # Arrow tip is at the end position
+    # Arms extend backward (opposite to travel direction)
+    backward = -tangent.normalized() * size
+
+    # Perpendicular for the V spread
+    up = Vector((0, 0, 1))
+    right = tangent.cross(up)
+    if right.length < 0.0001:
+        right = Vector((1, 0, 0))
+    right = right.normalized() * size * 0.5
+
+    # V tip at end, arms go backward and outward
+    tip = world_pos
+    left_arm = world_pos + backward + right
+    right_arm = world_pos + backward - right
+
+    # Two lines: tip to left_arm, tip to right_arm
+    return [
+        (tip.x, tip.y, tip.z + 0.01),
+        (left_arm.x, left_arm.y, left_arm.z + 0.01),
+        (tip.x, tip.y, tip.z + 0.01),
+        (right_arm.x, right_arm.y, right_arm.z + 0.01),
+    ]
+
+
+def _extract_keyframe_data(gp_obj, fc_x, fc_y, fc_z, settings):
+    """
+    Extract keyframe positions and tangents for arrows and labels.
+
+    Detects actual keyframes from F-curves and computes tangent
+    direction at each keyframe by sampling slightly before/after.
+
+    Args:
+        gp_obj: The Grease Pencil object
+        fc_x, fc_y, fc_z: Location F-curves
+        settings: WorldOnionSettings
+
+    Returns:
+        List of (world_pos, frame_num, tangent) tuples
+    """
+    if not fc_x or not fc_x.keyframe_points:
+        return []
+
+    keyframe_data = []
+    z_offset = settings.stroke_z_offset
+    depth_enabled = settings.depth_interaction_enabled
+
+    # Get all keyframe frame numbers
+    keyframe_frames = sorted(set(int(kp.co[0]) for kp in fc_x.keyframe_points))
+
+    for frame in keyframe_frames:
+        # Sample position at keyframe
+        x = fc_x.evaluate(frame)
+        y = fc_y.evaluate(frame)
+        z = fc_z.evaluate(frame)
+        pos = Vector((x, y, z))
+
+        # Apply shrinkwrap offset if enabled
+        if depth_enabled:
+            baked_offset = get_baked_offset(frame)
+            if baked_offset is not None:
+                pos.z += baked_offset
+
+        # Apply z_offset
+        if z_offset > 0:
+            pos.z += z_offset
+
+        # Compute tangent by sampling before/after
+        delta = 0.5
+        x_before = fc_x.evaluate(frame - delta)
+        y_before = fc_y.evaluate(frame - delta)
+        z_before = fc_z.evaluate(frame - delta)
+
+        x_after = fc_x.evaluate(frame + delta)
+        y_after = fc_y.evaluate(frame + delta)
+        z_after = fc_z.evaluate(frame + delta)
+
+        tangent = Vector((x_after - x_before, y_after - y_before, z_after - z_before))
+
+        keyframe_data.append((pos, frame, tangent))
+
+    return keyframe_data
 
 
 def get_draw_handlers():
@@ -913,9 +1117,15 @@ def draw_motion_path_callback():
     GPU draw callback - renders motion path connecting object locations.
     Samples F-Curves to draw path.
     Respects depth interaction (shrinkwrap) if enabled.
+
+    Also renders visualization enhancements:
+    - Arc/Ease spacing dots (uniform arc-length placement)
+    - Direction arrows at keyframes
     """
     global _motion_path_cache, _motion_path_cache_gp, _motion_path_dirty
     global _motion_path_coords, _motion_path_line_batch, _motion_path_point_batch
+    global _motion_path_spacing_dots_batch, _motion_path_arrows_batch, _motion_path_keyframe_data
+    global _motion_path_keyframe_circles_batch, _motion_path_inbetween_ticks_batch
 
     try:
         scene = bpy.context.scene
@@ -959,100 +1169,73 @@ def draw_motion_path_callback():
             _motion_path_dirty = False
             return
 
-        # Sample path
-        # Determine step based on duration to avoid too many points
-        duration = end_frame - start_frame
-        step = max(1, duration // 100)  # Limit to ~100 points
-        
+        # Sample F-curves at fractional frames for smooth path
+        # F-curves are Bezier curves - they interpolate perfectly at any frame value
+        # No need for Catmull-Rom subdivision - just sample at high resolution
+        MOTION_PATH_SAMPLES = 500  # Fixed sample count - enough for sharp Bezier curves
+
         points = []
-        
-        # Save current frame
-        original_frame = scene.frame_current
-        
-        # Sample frames
-        # Note: This is slow-ish but necessary to see evaluated positions
-        # Faster way is evaluation via fcurves directly but that ignores constraints?
-        # Actually we want to visualize the F-Curve + Raycast adjustment.
-        # Since we adjust in frame_change_post, standard evaluation doesn't show it unless we run the handler logic here.
-        
-        # Optimization: Just evaluate F-Curves for raw position, then apply raycast logic
-        # This avoids scene.frame_set() overhead
-        
+
         # Get location fcurves
         fcurves = gp_obj.animation_data.action.fcurves
         fc_x = fcurves.find('location', index=0)
         fc_y = fcurves.find('location', index=1)
         fc_z = fcurves.find('location', index=2)
-        
+
         # Cache z_offset setting for motion path
         z_offset = settings.stroke_z_offset
+        duration = end_frame - start_frame
 
         if not fc_x or not fc_y or not fc_z:
-             # Fallback to frame_set if incomplete
-             for f in range(start_frame, end_frame + 1, step):
-                 scene.frame_set(f)
-                 # Our handler runs on frame_set, so gp_obj.location is adjusted
-                 pos = gp_obj.location.copy()
-                 # Add z_offset to motion path (handler already applies via delta_location)
-                 # Note: When using frame_set, delta_location.z is already applied by driver/direct assignment
-                 # But we still add z_offset here for consistency in visualization
-                 points.append(pos)
-             scene.frame_set(original_frame)
+            # Fallback to frame_set if F-curves incomplete
+            original_frame = scene.frame_current
+            step = max(1, duration // MOTION_PATH_SAMPLES)
+            for f in range(start_frame, end_frame + 1, step):
+                scene.frame_set(f)
+                pos = gp_obj.location.copy()
+                points.append(pos)
+            scene.frame_set(original_frame)
         else:
-             # Evaluate F-Curves + apply shrinkwrap using BAKED offsets (v7 BULLETPROOF)
-             for f in range(start_frame, end_frame + 1, step):
-                 x = fc_x.evaluate(f)
-                 y = fc_y.evaluate(f)
-                 z = fc_z.evaluate(f)
+            # Sample F-curves at fractional frames - inherently smooth
+            frame_step = duration / MOTION_PATH_SAMPLES if MOTION_PATH_SAMPLES > 0 else 1
 
-                 pos = Vector((x, y, z))
+            for i in range(MOTION_PATH_SAMPLES + 1):
+                f = start_frame + i * frame_step  # Fractional frame value
+                x = fc_x.evaluate(f)
+                y = fc_y.evaluate(f)
+                z = fc_z.evaluate(f)
 
-                 if settings.depth_interaction_enabled:
-                     # v7.1: Use ONLY baked offsets - no runtime raycast
-                     baked_offset = get_baked_offset(f)
-                     if baked_offset is not None:
-                         pos.z += baked_offset
-                     # No fallback - if not baked, just use raw F-curve position
+                pos = Vector((x, y, z))
 
-                 # Always add z_offset to motion path visualization
-                 # This matches the driver behavior: shrinkwrap_offset(frame) + z_offset
-                 if z_offset > 0:
-                     pos.z += z_offset
+                # Apply shrinkwrap: interpolate between baked integer frame offsets
+                if settings.depth_interaction_enabled:
+                    floor_f = int(f)
+                    ceil_f = floor_f + 1
+                    t = f - floor_f  # Fractional part
 
-                 points.append(pos)
+                    off1 = get_baked_offset(floor_f)
+                    off2 = get_baked_offset(ceil_f)
+
+                    if off1 is not None and off2 is not None:
+                        # Lerp between baked offsets
+                        pos.z += off1 + (off2 - off1) * t
+                    elif off1 is not None:
+                        pos.z += off1
+                    elif off2 is not None:
+                        pos.z += off2
+
+                # Always add z_offset to motion path visualization
+                if z_offset > 0:
+                    pos.z += z_offset
+
+                points.append(pos)
 
         _motion_path_cache = points
         _motion_path_cache_gp = gp_obj
         _motion_path_dirty = False
 
-        # Build GPU batches once and cache them
+        # Build GPU batch directly - no smoothing needed, F-curves are already smooth
         coords = [(p.x, p.y, p.z) for p in points]
-
-        # Apply Catmull-Rom smoothing if enabled
-        if settings.motion_path_smoothing > 0 and len(coords) >= 4:
-            smoothed = []
-            subdivisions = settings.motion_path_smoothing
-
-            for i in range(len(coords) - 1):
-                # Get 4 control points (clamp at boundaries)
-                p0 = coords[max(0, i - 1)]
-                p1 = coords[i]
-                p2 = coords[min(len(coords) - 1, i + 1)]
-                p3 = coords[min(len(coords) - 1, i + 2)]
-
-                # Add start point
-                smoothed.append(p1)
-
-                # Add interpolated points between p1 and p2
-                for j in range(1, subdivisions + 1):
-                    t = j / (subdivisions + 1)
-                    pt = catmull_rom_point(p0, p1, p2, p3, t)
-                    smoothed.append((pt.x, pt.y, pt.z))
-
-            # Add final point
-            smoothed.append(coords[-1])
-            coords = smoothed
-
         _motion_path_coords = coords
         _motion_path_line_batch = batch_for_shader(
             _get_stroke_shader(), 'LINE_STRIP', {"pos": _motion_path_coords}
@@ -1062,12 +1245,177 @@ def draw_motion_path_callback():
             _get_fill_shader(), 'POINTS', {"pos": [(p.x, p.y, p.z) for p in points]}
         )
 
+        # Build visualization enhancement batches
+        fill_shader = _get_fill_shader()
+
+        # Timing Chart: Keyframe circles + Inbetween ticks
+        # Keyframes are shown as filled circles, inbetweens as perpendicular tick marks
+        # Uses F-curve evaluation to match path exactly (respects Bezier interpolation)
+        log(f"SPACING_DOTS: enabled={settings.motion_path_spacing_dots_enabled} coords_len={len(coords)}", "DOTS")
+        if settings.motion_path_spacing_dots_enabled and fc_x and fc_x.keyframe_points:
+            tick_length = 0.04  # Fixed length in world units for tick marks
+            circle_radius = 0.03  # Radius for keyframe circles
+            circle_segments = 10  # Number of triangles for circle (triangle fan)
+
+            inbetween_line_coords = []  # Tick marks (LINES)
+            keyframe_circle_coords = []  # Filled circles (TRIS)
+
+            # Get keyframe frames as a set for O(1) lookup
+            keyframe_frames = set(int(kp.co[0]) for kp in fc_x.keyframe_points)
+
+            # For each integer frame, evaluate F-curves directly (matches path exactly)
+            for frame in range(start_frame, end_frame + 1):
+                # Evaluate F-curves at this frame - respects Bezier/Linear/Constant interpolation
+                x = fc_x.evaluate(frame)
+                y = fc_y.evaluate(frame)
+                z = fc_z.evaluate(frame)
+                pos = Vector((x, y, z))
+
+                # Apply shrinkwrap if enabled
+                if settings.depth_interaction_enabled:
+                    baked_offset = get_baked_offset(frame)
+                    if baked_offset is not None:
+                        pos.z += baked_offset
+
+                # Apply z_offset
+                if z_offset > 0:
+                    pos.z += z_offset
+
+                pos.z += 0.01  # Render in front
+
+                # Calculate tangent by sampling slightly before/after
+                delta = 0.5
+                x_before = fc_x.evaluate(frame - delta)
+                y_before = fc_y.evaluate(frame - delta)
+                x_after = fc_x.evaluate(frame + delta)
+                y_after = fc_y.evaluate(frame + delta)
+                tangent = Vector((x_after - x_before, y_after - y_before, 0))
+                if tangent.length < 0.001:
+                    tangent = Vector((1, 0, 0))
+                tangent = tangent.normalized()
+
+                # Check if this is a keyframe or inbetween
+                if frame in keyframe_frames:
+                    # KEYFRAME: Build filled circle using triangle fan
+                    # Circle lies in XY plane at pos.z
+                    center = (pos.x, pos.y, pos.z)
+                    for seg in range(circle_segments):
+                        angle1 = (seg / circle_segments) * 2 * math.pi
+                        angle2 = ((seg + 1) / circle_segments) * 2 * math.pi
+                        # Triangle: center, edge1, edge2
+                        edge1 = (
+                            pos.x + circle_radius * math.cos(angle1),
+                            pos.y + circle_radius * math.sin(angle1),
+                            pos.z
+                        )
+                        edge2 = (
+                            pos.x + circle_radius * math.cos(angle2),
+                            pos.y + circle_radius * math.sin(angle2),
+                            pos.z
+                        )
+                        keyframe_circle_coords.extend([center, edge1, edge2])
+                else:
+                    # INBETWEEN: Build perpendicular tick mark
+                    # Perpendicular direction
+                    up = Vector((0, 0, 1))
+                    perp = tangent.cross(up)
+                    if perp.length < 0.001:
+                        perp = Vector((1, 0, 0))
+                    perp = perp.normalized() * tick_length
+
+                    p1 = pos - perp
+                    p2 = pos + perp
+                    inbetween_line_coords.append((p1.x, p1.y, p1.z))
+                    inbetween_line_coords.append((p2.x, p2.y, p2.z))
+
+            # Build separate batches for keyframes and inbetweens
+            if keyframe_circle_coords:
+                _motion_path_keyframe_circles_batch = batch_for_shader(
+                    fill_shader, 'TRIS', {"pos": keyframe_circle_coords}
+                )
+                log(f"TIMING: built {len(keyframe_circle_coords)//3} keyframe circle triangles", "DOTS")
+            else:
+                _motion_path_keyframe_circles_batch = None
+
+            if inbetween_line_coords:
+                stroke_shader = _get_stroke_shader()
+                _motion_path_inbetween_ticks_batch = batch_for_shader(
+                    stroke_shader, 'LINES', {"pos": inbetween_line_coords}
+                )
+                log(f"TIMING: built {len(inbetween_line_coords)//2} inbetween ticks", "DOTS")
+            else:
+                _motion_path_inbetween_ticks_batch = None
+
+            # Keep legacy batch for backwards compatibility (will be None)
+            _motion_path_spacing_dots_batch = None
+        else:
+            _motion_path_spacing_dots_batch = None
+            _motion_path_keyframe_circles_batch = None
+            _motion_path_inbetween_ticks_batch = None
+
+        # Direction Arrows and Keyframe Data - extract from F-curves
+        if settings.motion_path_arrows_enabled or settings.motion_path_labels_enabled:
+            _motion_path_keyframe_data = _extract_keyframe_data(gp_obj, fc_x, fc_y, fc_z, settings)
+
+            if settings.motion_path_arrows_enabled and len(points) >= 2:
+                # Use the path's actual last point for arrow position (already has shrinkwrap applied)
+                # This ensures the arrow sits exactly on the path, not floating above it
+                last_point = points[-1]
+                second_last = points[-2]
+                # Compute tangent from the last segment of the actual path
+                tangent = Vector((
+                    last_point.x - second_last.x,
+                    last_point.y - second_last.y,
+                    last_point.z - second_last.z
+                ))
+                # Create arrow data using actual path end point
+                arrow_data = [(last_point, end_frame, tangent)]
+                arrow_lines = _build_arrow_geometry(arrow_data, settings.motion_path_arrows_size)
+                if arrow_lines:
+                    # Use POLYLINE shader for controllable line width
+                    stroke_shader = _get_stroke_shader()
+                    _motion_path_arrows_batch = batch_for_shader(
+                        stroke_shader, 'LINES', {"pos": arrow_lines}
+                    )
+                else:
+                    _motion_path_arrows_batch = None
+            else:
+                _motion_path_arrows_batch = None
+        else:
+            _motion_path_keyframe_data = None
+            _motion_path_arrows_batch = None
+
     path_points = _motion_path_cache
     if not path_points or len(path_points) < 2:
         return
 
     # Check if batches are available
     if _motion_path_line_batch is None:
+        return
+
+    # Lazy rebuild: if visualization enhancements are enabled but batches are None,
+    # force a rebuild by marking dirty and returning (will render next frame)
+    needs_rebuild = False
+    # Timing chart uses keyframe circles + inbetween ticks (both must be checked)
+    if settings.motion_path_spacing_dots_enabled:
+        if _motion_path_keyframe_circles_batch is None and _motion_path_inbetween_ticks_batch is None:
+            needs_rebuild = True
+            log("LAZY_REBUILD: timing ticks enabled but batches are None", "DOTS")
+    if settings.motion_path_arrows_enabled and _motion_path_arrows_batch is None:
+        needs_rebuild = True
+    if settings.motion_path_labels_enabled and _motion_path_keyframe_data is None:
+        needs_rebuild = True
+
+    if needs_rebuild:
+        _motion_path_dirty = True
+        log("LAZY_REBUILD: triggering rebuild", "DOTS")
+        # Request a redraw so we rebuild next frame
+        try:
+            for area in bpy.context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+        except (RuntimeError, AttributeError):
+            pass  # Context unavailable
         return
 
     # Set up GPU state
@@ -1095,6 +1443,51 @@ def draw_motion_path_callback():
         point_shader.uniform_float("color", color)
         _motion_path_point_batch.draw(point_shader)
 
+    # Draw visualization enhancements using POLYLINE shader for line width control
+    stroke_shader = _get_stroke_shader()
+    region = bpy.context.region
+
+    # Draw Timing Chart: Inbetween ticks first, then keyframe circles on top
+    log(f"DRAW_TIMING: enabled={settings.motion_path_spacing_dots_enabled} ticks={_motion_path_inbetween_ticks_batch is not None} circles={_motion_path_keyframe_circles_batch is not None}", "DOTS")
+    if settings.motion_path_spacing_dots_enabled:
+        gpu.state.depth_test_set('NONE')
+        gpu.state.depth_mask_set(False)
+        gpu.state.blend_set('ALPHA')
+
+        # Draw inbetween ticks (perpendicular lines) with tick color
+        if _motion_path_inbetween_ticks_batch is not None:
+            stroke_shader.bind()
+            stroke_shader.uniform_float("viewportSize", (region.width, region.height))
+            stroke_shader.uniform_float("lineWidth", settings.motion_path_spacing_dots_size)
+            tick_color = tuple(settings.motion_path_spacing_dots_color)
+            stroke_shader.uniform_float("color", tick_color)
+            _motion_path_inbetween_ticks_batch.draw(stroke_shader)
+
+        # Draw keyframe circles (filled) with keyframe color (on top)
+        if _motion_path_keyframe_circles_batch is not None:
+            fill_shader = _get_fill_shader()
+            fill_shader.bind()
+            keyframe_color = tuple(settings.motion_path_keyframe_color)
+            fill_shader.uniform_float("color", keyframe_color)
+            _motion_path_keyframe_circles_batch.draw(fill_shader)
+
+        gpu.state.depth_test_set('LESS_EQUAL')
+
+    # Draw Direction Arrows (V/chevron)
+    if settings.motion_path_arrows_enabled and _motion_path_arrows_batch is not None:
+        gpu.state.depth_test_set('NONE')
+        gpu.state.blend_set('ALPHA')
+
+        stroke_shader.bind()
+        stroke_shader.uniform_float("viewportSize", (region.width, region.height))
+        # Arrow size setting controls both V size and line thickness
+        stroke_shader.uniform_float("lineWidth", settings.motion_path_arrows_size * 20.0)
+        arrow_color = tuple(settings.motion_path_arrows_color)
+        stroke_shader.uniform_float("color", arrow_color)
+        _motion_path_arrows_batch.draw(stroke_shader)
+
+        gpu.state.depth_test_set('LESS_EQUAL')
+
     # Reset GPU state
     gpu.state.blend_set('NONE')
     gpu.state.depth_test_set('NONE')
@@ -1102,9 +1495,83 @@ def draw_motion_path_callback():
     gpu.state.point_size_set(1.0)
 
 
+def draw_motion_path_labels_callback():
+    """
+    POST_PIXEL draw callback - renders frame number labels at keyframe positions.
+
+    This uses Blender's blf module for 2D text rendering in screen space.
+    The labels are projected from 3D keyframe positions to 2D screen coords.
+    """
+    # Early exit if no keyframe data (check before accessing context)
+    if _motion_path_keyframe_data is None or len(_motion_path_keyframe_data) == 0:
+        return
+
+    try:
+        scene = bpy.context.scene
+        region = bpy.context.region
+        region_data = bpy.context.region_data
+    except (RuntimeError, AttributeError, TypeError):
+        return
+
+    # Validate context objects
+    if scene is None or region is None or region_data is None:
+        return
+
+    if not hasattr(scene, 'world_onion'):
+        return
+
+    settings = scene.world_onion
+
+    if not settings.enabled:
+        return
+
+    if not settings.motion_path_enabled:
+        return
+
+    if not settings.motion_path_labels_enabled:
+        return
+
+    try:
+        # Get label settings
+        font_size = settings.motion_path_labels_size
+        label_color = tuple(settings.motion_path_labels_color)
+
+        # Font ID 0 is the default font
+        font_id = 0
+
+        # Set up blf
+        blf.size(font_id, font_size)
+        blf.color(font_id, label_color[0], label_color[1], label_color[2], label_color[3])
+
+        # Draw label for each keyframe
+        for world_pos, frame_num, tangent in _motion_path_keyframe_data:
+            # Project 3D position to 2D screen coordinates
+            screen_pos = location_3d_to_region_2d(region, region_data, world_pos)
+
+            if screen_pos is None:
+                continue  # Behind camera or outside viewport
+
+            # Format label text
+            label_text = f"F{frame_num}"
+
+            # Offset label slightly from keyframe position to avoid overlap
+            offset_x = 8
+            offset_y = 8
+
+            x = screen_pos.x + offset_x
+            y = screen_pos.y + offset_y
+
+            # Draw the label
+            blf.position(font_id, x, y, 0)
+            blf.draw(font_id, label_text)
+    except (RuntimeError, AttributeError, TypeError):
+        # Silently handle context errors during drawing
+        pass
+
+
 def register_draw_handlers():
     """Register GPU draw handlers."""
-    global _draw_handler, _anchor_draw_handler, _motion_path_handler
+    global _draw_handler, _anchor_draw_handler, _motion_path_handler, _motion_path_labels_handler
     global _motion_path_cache, _motion_path_cache_gp, _motion_path_dirty
 
     if _draw_handler is None:
@@ -1122,6 +1589,12 @@ def register_draw_handlers():
             draw_motion_path_callback, (), 'WINDOW', 'POST_VIEW'
         )
 
+    # Frame labels use POST_PIXEL for screen-space 2D text rendering
+    if _motion_path_labels_handler is None:
+        _motion_path_labels_handler = bpy.types.SpaceView3D.draw_handler_add(
+            draw_motion_path_labels_callback, (), 'WINDOW', 'POST_PIXEL'
+        )
+
     # Force motion path rebuild on registration (fixes reload not showing path)
     _motion_path_cache = None
     _motion_path_cache_gp = None
@@ -1130,7 +1603,7 @@ def register_draw_handlers():
 
 def unregister_draw_handlers():
     """Unregister GPU draw handlers."""
-    global _draw_handler, _anchor_draw_handler, _motion_path_handler
+    global _draw_handler, _anchor_draw_handler, _motion_path_handler, _motion_path_labels_handler
 
     if _draw_handler is not None:
         try:
@@ -1152,3 +1625,10 @@ def unregister_draw_handlers():
         except ValueError:
             pass
         _motion_path_handler = None
+
+    if _motion_path_labels_handler is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(_motion_path_labels_handler, 'WINDOW')
+        except ValueError:
+            pass
+        _motion_path_labels_handler = None

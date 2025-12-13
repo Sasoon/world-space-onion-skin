@@ -18,7 +18,7 @@ from .anchors import (
     get_current_keyframes_set,
     get_visible_keyframe,
 )
-from .transforms import get_layer_transform, get_camera_direction, align_canvas_to_cursor, ensure_billboard_constraint, align_strokes_to_camera
+from .transforms import get_layer_transform, align_canvas_to_cursor, ensure_billboard_constraint, align_strokes_to_camera
 from .drawing import invalidate_motion_path, get_baked_offset, is_driver_setup_pending, complete_pending_driver_setup
 from .debug_log import log
 
@@ -64,6 +64,11 @@ class WONION_OT_cursor_sync(bpy.types.Operator):
     _last_frame_time = None
     _is_animating = False  # Combined play+scrub state
     _scrub_cooldown = 0.0
+    # Auto-Draw mode (Object follows Cursor) - debounce tracking
+    _last_cursor_pos = None
+    _cursor_settle_time = 0.0
+    _triggered_for_position = False
+    _triggered_cursor_pos = None  # Track which cursor position was triggered
 
     def modal(self, context, event):
         # Check if addon still enabled
@@ -111,17 +116,17 @@ class WONION_OT_cursor_sync(bpy.types.Operator):
             elif not is_animating and self._is_animating:
                 # CRITICAL FIX: Sync cursor BEFORE showing canvas
                 # Without this, canvas shows at stale cursor position from before animation
-                if settings.anchor_enabled and settings.anchor_auto_cursor:
+                # Sync to stored ANCHOR (works in ALL modes)
+                if settings.anchor_enabled:
                     gp_obj = get_active_gp(context)
                     if gp_obj:
-                        try:
-                            depsgraph = context.evaluated_depsgraph_get()
-                            gp_obj_eval = gp_obj.evaluated_get(depsgraph)
-                            context.scene.cursor.location = gp_obj_eval.matrix_world.translation
-                            set_last_cursor_synced_frame(current_frame)
-                            log(f"MODAL_CURSOR_ON_STOP frame={current_frame}", "CURSOR")
-                        except Exception as e:
-                            log(f"MODAL_CURSOR_ON_STOP FAILED: {e}", "ERROR")
+                        active_layer = gp_obj.data.layers.active
+                        if active_layer:
+                            anchor_pos = get_anchor_for_frame(gp_obj, active_layer.name, current_frame)
+                            if anchor_pos is not None:
+                                context.scene.cursor.location = anchor_pos.copy()
+                                set_last_cursor_synced_frame(current_frame)
+                                log(f"ANCHOR_SYNC_ON_STOP frame={current_frame}", "CURSOR")
 
                 # v9.3: Complete pending driver setup now that playback stopped
                 # This is a safe context - modal callbacks can modify ID data
@@ -139,22 +144,98 @@ class WONION_OT_cursor_sync(bpy.types.Operator):
             # Track frame for scrub detection
             if current_frame != self._last_frame:
                 self._last_frame = current_frame
+                # Reset settle time but NOT triggered flag
+                # (triggered flag tracks cursor POSITION, not frame - prevents scrub creating keyframes)
+                self._cursor_settle_time = 0.0
 
                 # ONLY update cursor when STATIONARY (not animating)
                 # This eliminates jitter and lag during playback/scrub
+                # Sync cursor to stored ANCHOR position (works in ALL modes, not just CURSOR_FOLLOWS)
                 if not is_animating:
-                    if settings.anchor_enabled and settings.anchor_auto_cursor:
-                        if current_frame != get_last_cursor_synced_frame():
+                    if settings.anchor_enabled:
+                        gp_obj = get_active_gp(context)
+                        if gp_obj:
+                            active_layer = gp_obj.data.layers.active
+                            if active_layer:
+                                # Look up stored anchor for this frame
+                                anchor_pos = get_anchor_for_frame(gp_obj, active_layer.name, current_frame)
+                                if anchor_pos is not None:
+                                    context.scene.cursor.location = anchor_pos.copy()
+                                    set_last_cursor_synced_frame(current_frame)
+                                    log(f"ANCHOR_SYNC frame={current_frame}", "CURSOR")
+
+            # === CURSOR FOLLOWS OBJECT MODE ===
+            # Continuously sync cursor to object BASE position (runs every timer tick when stationary)
+            # IMPORTANT: Use gp_obj.location (base) NOT matrix_world.translation (evaluated)
+            # to prevent feedback loop with shrinkwrap delta_location offset
+            if not is_animating and settings.anchor_enabled and settings.anchor_sync_mode == 'CURSOR_FOLLOWS':
+                gp_obj = get_active_gp(context)
+                if gp_obj:
+                    # Use base location to match what OBJECT_FOLLOWS writes
+                    obj_pos = gp_obj.location
+                    cursor_pos = context.scene.cursor.location
+                    # Only update if cursor is not already at object position
+                    if (obj_pos - cursor_pos).length > 0.0001:
+                        context.scene.cursor.location = obj_pos.copy()
+
+            # === AUTO-DRAW MODE: Object follows Cursor ===
+            # When cursor moves and settles (100ms debounce), move object to cursor
+            # Strokes move WITH object (no compensation) - different from Set Anchor operator
+            if not is_animating and settings.anchor_enabled and settings.anchor_sync_mode == 'OBJECT_FOLLOWS':
+                scene = context.scene
+                current_cursor = scene.cursor.location.copy()
+
+                if self._last_cursor_pos is None:
+                    self._last_cursor_pos = current_cursor
+                else:
+                    cursor_moved = (current_cursor - self._last_cursor_pos).length > 0.001
+
+                    # Also check if cursor moved from last triggered position (allows re-trigger)
+                    if self._triggered_for_position and self._triggered_cursor_pos is not None:
+                        if (current_cursor - self._triggered_cursor_pos).length > 0.01:
+                            # Cursor moved to new position - allow new trigger
+                            self._triggered_for_position = False
+
+                    if cursor_moved:
+                        # Cursor moving - reset settle timer
+                        self._cursor_settle_time = 0.0
+                        self._last_cursor_pos = current_cursor
+                    else:
+                        # Cursor stationary - accumulate settle time (16ms per timer tick)
+                        self._cursor_settle_time += 0.016
+
+                        # After 100ms settled, trigger auto-move (once per position)
+                        if self._cursor_settle_time >= 0.1 and not self._triggered_for_position:
                             gp_obj = get_active_gp(context)
                             if gp_obj:
-                                try:
-                                    depsgraph = context.evaluated_depsgraph_get()
-                                    gp_obj_eval = gp_obj.evaluated_get(depsgraph)
-                                    context.scene.cursor.location = gp_obj_eval.matrix_world.translation
-                                    set_last_cursor_synced_frame(current_frame)
-                                    log(f"MODAL_CURSOR frame={current_frame}", "CURSOR")
-                                except Exception as e:
-                                    log(f"MODAL_CURSOR frame={current_frame} FAILED: {e}", "ERROR")
+                                active_layer = gp_obj.data.layers.active
+                                if active_layer:
+                                    try:
+                                        log(f"AUTO_DRAW: Cursor settled, moving object to {current_cursor[:]}", "CURSOR")
+
+                                        # Ensure animation data exists before keyframe insertion
+                                        if gp_obj.animation_data is None:
+                                            gp_obj.animation_data_create()
+                                        if gp_obj.animation_data.action is None:
+                                            gp_obj.animation_data.action = bpy.data.actions.new(
+                                                name=f"{gp_obj.name}Action"
+                                            )
+
+                                        # Simple object move - strokes follow (no compensation)
+                                        gp_obj.location = current_cursor.copy()
+                                        gp_obj.keyframe_insert(data_path="location", frame=scene.frame_current)
+
+                                        # Store anchor metadata
+                                        set_anchor_for_frame(gp_obj, active_layer.name,
+                                                             scene.frame_current, current_cursor)
+
+                                        # Invalidate motion path ONCE (not on every timer tick)
+                                        invalidate_motion_path()
+                                    except Exception as e:
+                                        log(f"AUTO_DRAW FAILED: {e}", "ERROR")
+
+                            self._triggered_for_position = True
+                            self._triggered_cursor_pos = current_cursor.copy()
 
         return {'PASS_THROUGH'}
 
@@ -190,6 +271,11 @@ class WONION_OT_cursor_sync(bpy.types.Operator):
         self._last_frame_time = time.time()
         self._is_animating = False
         self._scrub_cooldown = 0.0
+        # Auto-Draw mode (Object follows Cursor) state
+        self._last_cursor_pos = None
+        self._cursor_settle_time = 0.0
+        self._triggered_for_position = False
+        self._triggered_cursor_pos = None
 
         wm = context.window_manager
         self._timer = wm.event_timer_add(0.016, window=context.window)
@@ -389,6 +475,12 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
     log(f"  MOVING object to {target_world_pos[:]}", "SNAP")
     gp_obj.location = target_world_pos
 
+    # Ensure animation data exists before keyframe insertion
+    if gp_obj.animation_data is None:
+        gp_obj.animation_data_create()
+    if gp_obj.animation_data.action is None:
+        gp_obj.animation_data.action = bpy.data.actions.new(name=f"{gp_obj.name}Action")
+
     # Insert Keyframe for Location
     gp_obj.keyframe_insert(data_path="location", frame=current_frame)
     log(f"  Inserted location keyframe at frame {current_frame}", "SNAP")
@@ -567,8 +659,7 @@ class WONION_OT_set_anchor(bpy.types.Operator):
             self.report({'INFO'}, "Anchor set (Object moved to Cursor)")
             active_layer = gp_obj.data.layers.active
             if active_layer:
-                 cam_dir = get_camera_direction(scene)
-                 set_anchor_for_frame(gp_obj, active_layer.name, scene.frame_current, cursor_pos, cam_dir)
+                 set_anchor_for_frame(gp_obj, active_layer.name, scene.frame_current, cursor_pos)
             
         return result
 
@@ -611,8 +702,7 @@ class WONION_OT_snap_to_gp(bpy.types.Operator):
         if result == {'FINISHED'}:
             self.report({'INFO'}, "Snapped to GP (bottom-center)")
             scene.cursor.location = anchor_pos
-            cam_dir = get_camera_direction(scene)
-            set_anchor_for_frame(gp_obj, active_layer.name, scene.frame_current, anchor_pos, cam_dir)
+            set_anchor_for_frame(gp_obj, active_layer.name, scene.frame_current, anchor_pos)
 
             # v9.1.2: Auto-bake shrinkwrap after snap
             if settings.depth_interaction_enabled:
@@ -652,8 +742,7 @@ class WONION_OT_snap_to_cursor(bpy.types.Operator):
             self.report({'INFO'}, "Snapped strokes and Object to Cursor")
             active_layer = gp_obj.data.layers.active
             if active_layer:
-                cam_dir = get_camera_direction(scene)
-                set_anchor_for_frame(gp_obj, active_layer.name, scene.frame_current, cursor_pos, cam_dir)
+                set_anchor_for_frame(gp_obj, active_layer.name, scene.frame_current, cursor_pos)
 
             # v9.1.2: Auto-bake shrinkwrap after snap
             if settings.depth_interaction_enabled:
@@ -877,14 +966,9 @@ class WONION_OT_bake_shrinkwrap(bpy.types.Operator):
         # Without this, driver hasn't evaluated yet and cursor is at wrong position
         context.view_layer.update()
 
-        # Sync cursor to GP object's new position (with offset applied)
-        if settings.anchor_enabled and settings.anchor_auto_cursor:
-            try:
-                depsgraph = context.evaluated_depsgraph_get()
-                gp_obj_eval = gp_obj.evaluated_get(depsgraph)
-                context.scene.cursor.location = gp_obj_eval.matrix_world.translation
-            except:
-                pass
+        # Sync cursor to GP object's base position (not evaluated, to prevent feedback loop)
+        if settings.anchor_enabled and settings.anchor_sync_mode == 'CURSOR_FOLLOWS':
+            context.scene.cursor.location = gp_obj.location.copy()
 
         self.report({'INFO'}, f"Baked shrinkwrap for {count} frames")
 

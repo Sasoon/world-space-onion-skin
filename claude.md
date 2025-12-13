@@ -78,8 +78,7 @@ A Blender addon that provides **world-space onion skinning** for Grease Pencil o
 {
     "layer_name": {
         "123": {                         # Frame number as string key
-            "pos": [x, y, z],           # Cursor position
-            "cam_dir": [x, y, z]        # Camera direction snapshot
+            "pos": [x, y, z]            # Cursor position (world space)
         }
     }
 }
@@ -151,7 +150,7 @@ migrate_anchor_data(gp_obj, layer_name, old_frame, new_frame)
 | **Appearance** | `opacity`, `falloff`, `fill_opacity`, `line_width`, `color_before`, `color_after` |
 | **Motion Path** | `motion_path_enabled`, `motion_path_color`, `motion_path_width`, `motion_path_show_points`, `motion_path_smoothing` |
 | **Depth** | `depth_interaction_enabled`, `stroke_z_offset` |
-| **Anchors** | `anchor_enabled`, `anchor_auto_cursor` |
+| **Anchors** | `anchor_enabled`, `anchor_sync_mode` (NONE/CURSOR_FOLLOWS/OBJECT_FOLLOWS) |
 
 Update callbacks:
 - `update_enabled` - Registers/unregisters draw handlers

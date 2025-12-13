@@ -126,10 +126,10 @@ class WONION_PT_appearance(bpy.types.Panel):
         row.prop(settings, "color_after", text="")
 
 
-class WONION_PT_animation(bpy.types.Panel):
-    """Animation and Anchor settings sub-panel"""
-    bl_label = "Motion & Anchors"
-    bl_idname = "WONION_PT_animation"
+class WONION_PT_motion_path(bpy.types.Panel):
+    """Motion path visualization settings"""
+    bl_label = "Motion Path"
+    bl_idname = "WONION_PT_motion_path"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = 'Onion'
@@ -144,7 +144,6 @@ class WONION_PT_animation(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         settings = context.scene.world_onion
-        gp_obj = get_active_gp(context)
 
         # Motion Path
         row = layout.row(align=True)
@@ -154,7 +153,33 @@ class WONION_PT_animation(bpy.types.Panel):
             row.prop(settings, "motion_path_width", text="W")
 
             row = layout.row(align=True)
-            row.prop(settings, "motion_path_smoothing")
+            row.prop(settings, "motion_path_show_points", icon='KEYFRAME')
+
+            # Timing Chart Ticks (one per frame, like traditional animation)
+            # Keyframes = filled circles (keyframe color), Inbetweens = perpendicular ticks (tick color)
+            box = layout.box()
+            row = box.row(align=True)
+            row.prop(settings, "motion_path_spacing_dots_enabled", text="Timing Ticks")
+            if settings.motion_path_spacing_dots_enabled:
+                row.prop(settings, "motion_path_spacing_dots_color", text="")
+                row.prop(settings, "motion_path_keyframe_color", text="")
+                box.prop(settings, "motion_path_spacing_dots_size", text="Bold")
+
+            # Direction Arrows
+            box = layout.box()
+            row = box.row(align=True)
+            row.prop(settings, "motion_path_arrows_enabled")
+            if settings.motion_path_arrows_enabled:
+                row.prop(settings, "motion_path_arrows_color", text="")
+                box.prop(settings, "motion_path_arrows_size")
+
+            # Frame Labels
+            box = layout.box()
+            row = box.row(align=True)
+            row.prop(settings, "motion_path_labels_enabled")
+            if settings.motion_path_labels_enabled:
+                row.prop(settings, "motion_path_labels_color", text="")
+                box.prop(settings, "motion_path_labels_size")
 
         layout.separator()
 
@@ -171,14 +196,34 @@ class WONION_PT_animation(bpy.types.Panel):
                 row.label(text="", icon='ERROR')
         layout.prop(settings, "stroke_z_offset")
 
-        layout.separator()
+
+class WONION_PT_anchors(bpy.types.Panel):
+    """Drawing anchor position settings"""
+    bl_label = "Drawing Anchors"
+    bl_idname = "WONION_PT_anchors"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Onion'
+    bl_parent_id = "WONION_PT_main_panel"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        settings = context.scene.world_onion
+        return settings.enabled and get_active_gp(context) is not None
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.world_onion
+        gp_obj = get_active_gp(context)
 
         # Anchor System
         layout.prop(settings, "anchor_enabled")
-        
+
         if settings.anchor_enabled:
             box = layout.box()
-            box.prop(settings, "anchor_auto_cursor")
+            box.label(text="Sync Mode:")
+            box.prop(settings, "anchor_sync_mode", expand=True)  # Radio buttons
 
         layout.separator()
 
@@ -245,7 +290,8 @@ panel_classes = (
     WONION_PT_main_panel,
     WONION_PT_frames,
     WONION_PT_appearance,
-    WONION_PT_animation,
+    WONION_PT_motion_path,
+    WONION_PT_anchors,
     WONION_PT_cache,
     WONION_PT_dev,
 )

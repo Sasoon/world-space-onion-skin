@@ -105,33 +105,10 @@ def get_anchor_for_frame(gp_obj, layer_name, frame):
     return None
 
 
-def get_anchor_camera_dir(gp_obj, layer_name, frame):
-    """Get the camera direction stored with anchor for a specific layer and frame.
-
-    Returns Vector or None.
-    """
-    anchors = get_anchors(gp_obj)
-
-    if layer_name not in anchors:
-        return None
-
-    frame_str = str(frame)
-    if frame_str not in anchors[layer_name]:
-        return None
-
-    data = anchors[layer_name][frame_str]
-
-    if isinstance(data, dict) and "cam_dir" in data:
-        return Vector(data["cam_dir"])
-
-    return None
-
-
-def set_anchor_for_frame(gp_obj, layer_name, frame, position, camera_dir=None):
-    """Set the anchor position and camera direction for a specific layer and frame.
+def set_anchor_for_frame(gp_obj, layer_name, frame, position):
+    """Set the anchor position for a specific layer and frame.
 
     position: Vector or tuple (x, y, z)
-    camera_dir: Vector or tuple (x, y, z) - direction camera is facing
     """
     anchors = get_anchors(gp_obj)
 
@@ -139,21 +116,7 @@ def set_anchor_for_frame(gp_obj, layer_name, frame, position, camera_dir=None):
         anchors[layer_name] = {}
 
     frame_str = str(frame)
-
-    # Preserve existing data
-    if frame_str in anchors[layer_name]:
-        anchor_data = anchors[layer_name][frame_str]
-        if not isinstance(anchor_data, dict):
-            anchor_data = {}
-    else:
-        anchor_data = {}
-
-    anchor_data["pos"] = [position[0], position[1], position[2]]
-
-    if camera_dir is not None:
-        anchor_data["cam_dir"] = [camera_dir[0], camera_dir[1], camera_dir[2]]
-
-    anchors[layer_name][frame_str] = anchor_data
+    anchors[layer_name][frame_str] = {"pos": [position[0], position[1], position[2]]}
     set_anchors(gp_obj, anchors)
 
 

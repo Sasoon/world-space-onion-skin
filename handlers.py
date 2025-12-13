@@ -15,7 +15,7 @@ from .anchors import (
     get_visible_keyframe,
     migrate_anchor_data,
 )
-from .transforms import align_canvas_to_cursor, get_camera_direction, ensure_billboard_constraint
+from .transforms import align_canvas_to_cursor, ensure_billboard_constraint
 from .drawing import invalidate_motion_path
 from .debug_log import log, log_frame_change
 
@@ -253,8 +253,7 @@ def _on_depsgraph_update_impl(scene, depsgraph):
                         existing_anchor = get_anchor_for_frame(gp_obj, layer_name, frame_num)
                         if existing_anchor is None:
                             cursor_pos = scene.cursor.location.copy()
-                            cam_dir = get_camera_direction(scene)
-                            set_anchor_for_frame(gp_obj, layer_name, frame_num, cursor_pos, cam_dir)
+                            set_anchor_for_frame(gp_obj, layer_name, frame_num, cursor_pos)
 
         _last_keyframe_set = current_kf_set
 

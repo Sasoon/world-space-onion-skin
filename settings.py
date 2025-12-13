@@ -216,10 +216,15 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         update=update_anchor_enabled,  # v8.2: Canvas alignment done once here
     )
     
-    anchor_auto_cursor: bpy.props.BoolProperty(
-        name="Auto-Move Cursor",
-        description="Automatically move 3D cursor to anchor position on frame change",
-        default=True,
+    anchor_sync_mode: bpy.props.EnumProperty(
+        name="Sync Mode",
+        description="How cursor and object position interact",
+        items=[
+            ('NONE', "Manual", "No automatic sync - use Set Anchor button"),
+            ('CURSOR_FOLLOWS', "Cursor → Object", "Cursor follows object position"),
+            ('OBJECT_FOLLOWS', "Object → Cursor", "Object follows cursor (Auto-Draw mode)"),
+        ],
+        default='NONE',
         update=update_setting,
     )
 
@@ -261,11 +266,96 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         update=update_setting,
     )
 
-    motion_path_smoothing: bpy.props.IntProperty(
-        name="Smoothing",
-        description="Subdivisions for smooth curves (0=sharp, higher=smoother)",
-        default=0, min=0, max=200,
+    # Arc/Ease Spacing Dots - show timing visualization
+    motion_path_spacing_dots_enabled: bpy.props.BoolProperty(
+        name="Spacing Dots",
+        description="Show dots along path with spacing based on velocity (dense=slow, sparse=fast)",
+        default=False,
         update=update_motion_path_setting,
+    )
+
+    motion_path_spacing_dots_count: bpy.props.IntProperty(
+        name="Dot Count",
+        description="Number of spacing dots to show along the path",
+        default=50, min=10, max=200,
+        update=update_motion_path_setting,
+    )
+
+    motion_path_spacing_dots_size: bpy.props.FloatProperty(
+        name="Boldness",
+        description="Thickness/weight of timing chart tick marks",
+        default=3.0, min=1.0, max=10.0,
+        update=update_setting,  # Just redraws - lineWidth is GPU state
+    )
+
+    motion_path_spacing_dots_color: bpy.props.FloatVectorProperty(
+        name="Tick Color",
+        description="Color of timing chart tick marks",
+        subtype='COLOR',
+        size=4,
+        default=(1.0, 0.0, 0.0, 1.0),  # Bright red, full opacity for visibility
+        min=0.0, max=1.0,
+        update=update_setting,
+    )
+
+    motion_path_keyframe_color: bpy.props.FloatVectorProperty(
+        name="Key Color",
+        description="Color of keyframe markers (circles) on timing chart",
+        subtype='COLOR',
+        size=4,
+        default=(1.0, 1.0, 1.0, 1.0),  # White for visibility
+        min=0.0, max=1.0,
+        update=update_setting,
+    )
+
+    # Direction Arrows - show travel direction at keyframes
+    motion_path_arrows_enabled: bpy.props.BoolProperty(
+        name="Direction Arrows",
+        description="Show arrows at keyframe positions indicating direction of travel",
+        default=False,
+        update=update_motion_path_setting,
+    )
+
+    motion_path_arrows_size: bpy.props.FloatProperty(
+        name="Arrow Size",
+        description="Size of direction arrows in world units",
+        default=0.1, min=0.01, max=1.0,
+        update=update_motion_path_setting,
+    )
+
+    motion_path_arrows_color: bpy.props.FloatVectorProperty(
+        name="Arrow Color",
+        description="Color of direction arrows",
+        subtype='COLOR',
+        size=4,
+        default=(1.0, 0.5, 0.0, 0.9),  # Orange with alpha
+        min=0.0, max=1.0,
+        update=update_setting,
+    )
+
+    # Frame Labels - show frame numbers at keyframes
+    motion_path_labels_enabled: bpy.props.BoolProperty(
+        name="Frame Labels",
+        description="Show frame numbers at keyframe positions",
+        default=False,
+        update=update_setting,
+    )
+
+    motion_path_labels_size: bpy.props.IntProperty(
+        name="Label Size",
+        description="Font size for frame labels",
+        default=12, min=8, max=32,
+        update=update_setting,
+    )
+
+    motion_path_labels_color: bpy.props.FloatVectorProperty(
+        name="Label Color",
+        description="Color of frame number labels",
+        subtype='COLOR',
+        size=4,
+        default=(1.0, 1.0, 1.0, 0.9),  # White with alpha
+        min=0.0, max=1.0,
+        update=update_setting,
     )
 
     # Depth interaction (shrinkwrap) - strokes follow mesh surface
