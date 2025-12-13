@@ -10,6 +10,7 @@ from .cache import cache_current_frame, clear_cache, get_active_gp
 from .anchors import (
     get_anchor_for_frame,
     set_anchor_for_frame,
+    remove_anchor_for_frame,
     calculate_anchor_from_strokes,
     get_current_keyframes_set,
     get_visible_keyframe,
@@ -241,6 +242,25 @@ def _on_depsgraph_update_impl(scene, depsgraph):
                         added_sorted = sorted(added)
                         for old_frame, new_frame in zip(removed_sorted, added_sorted):
                             migrate_anchor_data(gp_obj, layer_name, old_frame, new_frame)
+
+            # Handle deleted keyframes - remove their anchors
+            # A keyframe is truly deleted if it was removed but not moved (no matching add)
+            for layer_name, removed_frames in removed_by_layer.items():
+                added_frames = added_by_layer.get(layer_name, [])
+                if len(removed_frames) > len(added_frames):
+                    # More removed than added = some were deleted (not moved)
+                    # Delete anchors for the extra removed frames
+                    # Sort both to match moves, then delete unmatched
+                    removed_sorted = sorted(removed_frames)
+                    num_moved = len(added_frames)
+                    for frame in removed_sorted[num_moved:]:
+                        remove_anchor_for_frame(gp_obj, layer_name, frame)
+                        log(f"ANCHOR_DELETE: removed anchor for deleted keyframe layer={layer_name} frame={frame}", "ANCHOR")
+                elif layer_name not in added_by_layer:
+                    # All keyframes in this layer were deleted (none moved)
+                    for frame in removed_frames:
+                        remove_anchor_for_frame(gp_obj, layer_name, frame)
+                        log(f"ANCHOR_DELETE: removed anchor for deleted keyframe layer={layer_name} frame={frame}", "ANCHOR")
 
             # Handle new keyframes
             if settings.anchor_enabled:

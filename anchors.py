@@ -23,14 +23,8 @@ def invalidate_anchor_json_cache():
 
 
 def _invalidate_all_anchor_caches():
-    """Invalidate both JSON cache and GPU batch cache."""
+    """Invalidate anchor JSON cache."""
     invalidate_anchor_json_cache()
-    # Also invalidate GPU batch cache (import here to avoid circular import)
-    try:
-        from .drawing import invalidate_anchor_batch_cache
-        invalidate_anchor_batch_cache()
-    except ImportError:
-        pass
 
 
 def get_anchors(gp_obj, use_cache=True):

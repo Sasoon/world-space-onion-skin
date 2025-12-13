@@ -66,6 +66,9 @@ def triangulate_fill(world_points):
 
 
 # Global cache - OrderedDict for O(1) eviction of oldest entries
+# NOTE: Cache key is frame-only (not including GP object) for simplicity.
+# This is safe because handlers.py clears the cache on GP object change
+# via _last_active_gp identity check in on_depsgraph_update.
 _cache = OrderedDict()  # {frame_number: [stroke_points_list, ...]}
 
 

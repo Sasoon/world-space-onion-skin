@@ -22,7 +22,10 @@ def update_enabled(self, context):
         register_draw_handlers()
         # v8.5: Start cursor sync modal operator for reliable cursor tracking
         # Import here to avoid circular import
-        from .operators import is_cursor_sync_running
+        from .operators import is_cursor_sync_running, reset_cursor_sync_state
+        # v9.4: Reset cursor sync state to recover from stuck state
+        # (e.g., if modal crashed without calling cancel() in previous session)
+        reset_cursor_sync_state()
         if not is_cursor_sync_running():
             bpy.ops.world_onion.cursor_sync('INVOKE_DEFAULT')
 
@@ -45,6 +48,8 @@ def update_enabled(self, context):
 def update_setting(self, context):
     """Called when display settings change."""
     # Just redraw - no need to invalidate cache
+    if context.screen is None:
+        return
     for area in context.screen.areas:
         if area.type in ('VIEW_3D', 'DOPESHEET_EDITOR', 'TIMELINE'):
             area.tag_redraw()
@@ -55,6 +60,8 @@ def update_motion_path_setting(self, context):
     # Invalidate motion path cache so it rebuilds with new smoothing
     invalidate_motion_path()
     # Redraw viewports
+    if context.screen is None:
+        return
     for area in context.screen.areas:
         if area.type == 'VIEW_3D':
             area.tag_redraw()
@@ -74,6 +81,8 @@ def update_anchor_enabled(self, context):
             pass  # May fail in some contexts, but that's OK - user can trigger manually
 
     # Redraw viewports
+    if context.screen is None:
+        return
     for area in context.screen.areas:
         if area.type in ('VIEW_3D', 'DOPESHEET_EDITOR', 'TIMELINE'):
             area.tag_redraw()
@@ -115,9 +124,10 @@ def update_realtime(self, context):
     current_frame = scene.frame_current
     scene.frame_set(current_frame)
 
-    for area in context.screen.areas:
-        if area.type == 'VIEW_3D':
-            area.tag_redraw()
+    if context.screen is not None:
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
 
 
 class WorldOnionSettings(bpy.types.PropertyGroup):

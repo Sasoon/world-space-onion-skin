@@ -41,6 +41,17 @@ def set_cursor_sync_running(value):
     _cursor_sync_running = value
 
 
+def reset_cursor_sync_state():
+    """Reset cursor sync state for recovery.
+
+    Call this when the addon is re-enabled to recover from stuck state
+    (e.g., if modal operator crashed without calling cancel()).
+    """
+    global _cursor_sync_running, _last_cursor_synced_frame
+    _cursor_sync_running = False
+    _last_cursor_synced_frame = None
+
+
 def get_last_cursor_synced_frame():
     """Get the last frame cursor was synced for (used by handler to avoid double-update)."""
     return _last_cursor_synced_frame
@@ -286,10 +297,14 @@ class WONION_OT_cursor_sync(bpy.types.Operator):
 
     def cancel(self, context):
         global _cursor_sync_running
-        if self._timer:
-            context.window_manager.event_timer_remove(self._timer)
+        try:
+            if self._timer:
+                context.window_manager.event_timer_remove(self._timer)
+        except (RuntimeError, AttributeError):
+            pass  # Timer may already be removed or context invalid
+        finally:
             self._timer = None
-        _cursor_sync_running = False
+            _cursor_sync_running = False
         # Ensure canvas is shown when modal stops
         self._show_canvas(context)
         log("Cursor sync modal stopped", "INFO")
@@ -489,10 +504,15 @@ def set_anchor_logic(context, gp_obj, scene, target_world_pos, move_selected_str
     # The early bake calculated offset for the OLD position. Now that we've inserted
     # a keyframe at the NEW position, we must re-bake so matrix_world_new has the
     # correct offset that matches what will be displayed after the operator completes.
+    # v9.4: Optimization - skip re-bake if position unchanged AND first bake was done
     if settings.depth_interaction_enabled:
-        log("  Re-baking shrinkwrap AFTER keyframe insert (position changed)", "SNAP")
-        from .drawing import bake_shrinkwrap_offsets
-        bake_shrinkwrap_offsets(gp_obj, settings, scene)
+        position_changed = (target_world_pos - old_location).length > 0.0001
+        if position_changed or not keyframe_copied:
+            log("  Re-baking shrinkwrap AFTER keyframe insert (position changed)", "SNAP")
+            from .drawing import bake_shrinkwrap_offsets
+            bake_shrinkwrap_offsets(gp_obj, settings, scene)
+        else:
+            log("  Skipping re-bake (position unchanged, already baked for held frame)", "SNAP")
 
     # CRITICAL: Use scene.frame_set() to force complete depsgraph rebuild
     # view_layer.update() alone doesn't re-evaluate billboard constraint rotation

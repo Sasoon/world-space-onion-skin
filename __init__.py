@@ -97,10 +97,12 @@ def register():
     # Register property group
     bpy.types.Scene.world_onion = bpy.props.PointerProperty(type=settings.WorldOnionSettings)
 
-    # Register handlers
+    # Register handlers (each has internal duplication check)
     handlers.register_handlers()
 
     # Register load handler to restore draw callbacks after file load
+    # NOTE: This is separate from handlers.on_load_post (which clears cache)
+    # Both have duplication checks and do different things
     if on_load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(on_load_post)
 

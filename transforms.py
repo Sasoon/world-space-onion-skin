@@ -99,14 +99,14 @@ def ensure_billboard_constraint(gp_obj, scene):
         constraint.name = CONSTRAINT_NAME
         modified = True
     
-    # Ensure all settings are correct
-    if constraint.use_x != True:
+    # Ensure all settings are correct (v9.4: idiomatic boolean comparisons)
+    if not constraint.use_x:
         constraint.use_x = True
         modified = True
-    if constraint.use_y != True:
+    if not constraint.use_y:
         constraint.use_y = True
         modified = True
-    if constraint.use_z != True:
+    if not constraint.use_z:
         constraint.use_z = True
         modified = True
     if constraint.mix_mode != 'REPLACE':

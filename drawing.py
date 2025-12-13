@@ -20,7 +20,6 @@ from .debug_log import log, log_onion_draw, log_bake, log_cursor
 
 # Draw handler references
 _draw_handler = None
-_anchor_draw_handler = None
 _motion_path_handler = None
 
 # Motion path cache
@@ -33,7 +32,6 @@ _motion_path_line_batch = None
 _motion_path_point_batch = None
 
 # Motion path visualization enhancements
-_motion_path_spacing_dots_batch = None  # GPU batch for arc-length spacing dots (DEPRECATED - see below)
 _motion_path_arrows_batch = None  # GPU batch for direction arrows (triangles)
 _motion_path_keyframe_data = None  # [(world_pos, frame_num, tangent), ...] for arrows/labels
 _motion_path_labels_handler = None  # POST_PIXEL handler for frame number labels
@@ -54,23 +52,19 @@ _driver_setup_pending = False  # True if driver needs setup from next safe conte
 _bake_in_progress = False  # Guard against overlapping bakes
 
 # Onion skin GPU batch cache - CRITICAL for performance near camera
-# Structure: {frame: {'fill_batches': [batch, ...], 'stroke_batches': [batch, ...]}}
-# Batches are keyed by frame and built once, reused on every redraw
+# Structure: {(frame, z_offset): {'fill_batches': [batch, ...], 'stroke_batches': [batch, ...]}}
+# Batches are keyed by (frame, z_offset) and built once, reused on every redraw
+# v9.4: Added size limit to prevent unbounded memory growth
 _onion_batch_cache = {}
 _onion_cache_z_offset = None  # Track z_offset to detect changes
 _onion_cache_gp = None  # Track GP object to detect changes
+_ONION_CACHE_MAX_SIZE = 100  # Maximum number of cached batch entries (FIFO eviction)
 
 # Keyframe list cache - avoid recomputing sorted keyframes on every draw
 # Invalidated when GP object changes or onion batch cache is cleared
 _keyframe_cache = None  # Sorted list of keyframe numbers
 _keyframe_cache_gp = None  # GP object the cache is for
 
-# Anchor batch cache - avoid creating GPU batches per anchor per redraw
-# Structure: {'points': batch, 'lines': batch, 'current_points': batch, 'current_lines': batch}
-_anchor_batch_cache = None
-_anchor_batch_gp = None  # GP object the cache is for
-_anchor_batch_dirty = True  # Force rebuild when anchors change
-_anchor_batch_frame = None  # Track frame to detect current anchor changes
 
 # v8.5: Timer code removed - now using modal operator in operators.py
 
@@ -95,10 +89,22 @@ def _get_fill_shader():
     return _fill_shader
 
 
+# Point shader for POINTS primitive
+_point_shader = None
+
+
+def _get_point_shader():
+    """Get cached POINT_UNIFORM_COLOR shader for drawing points."""
+    global _point_shader
+    if _point_shader is None:
+        _point_shader = gpu.shader.from_builtin('POINT_UNIFORM_COLOR')
+    return _point_shader
+
+
 def invalidate_motion_path():
     """Mark motion path cache as dirty, triggering rebuild on next draw."""
     global _motion_path_dirty, _motion_path_line_batch, _motion_path_point_batch, _motion_path_coords
-    global _motion_path_spacing_dots_batch, _motion_path_arrows_batch, _motion_path_keyframe_data
+    global _motion_path_arrows_batch, _motion_path_keyframe_data
     global _motion_path_keyframe_circles_batch, _motion_path_inbetween_ticks_batch
     _motion_path_dirty = True
     # Also invalidate GPU batch cache
@@ -106,7 +112,6 @@ def invalidate_motion_path():
     _motion_path_point_batch = None
     _motion_path_coords = None
     # Invalidate visualization enhancement batches
-    _motion_path_spacing_dots_batch = None
     _motion_path_arrows_batch = None
     _motion_path_keyframe_data = None
     # Invalidate timing chart batches (keyframe circles + inbetween ticks)
@@ -131,12 +136,6 @@ def invalidate_keyframe_cache():
     global _keyframe_cache, _keyframe_cache_gp
     _keyframe_cache = None
     _keyframe_cache_gp = None
-
-
-def invalidate_anchor_batch_cache():
-    """Mark anchor batches for rebuild. Call when anchor data changes."""
-    global _anchor_batch_dirty
-    _anchor_batch_dirty = True
 
 
 def invalidate_baked_offsets():
@@ -249,7 +248,7 @@ def _setup_shrinkwrap_driver(gp_obj):
     # Remove existing driver if present (avoid duplicates)
     try:
         gp_obj.driver_remove("delta_location", 2)  # index 2 = Z
-    except:
+    except RuntimeError:
         pass  # No driver existed
 
     # NOTE: Namespace function should be registered at addon load time
@@ -357,7 +356,7 @@ def remove_shrinkwrap_driver(gp_obj):
     try:
         gp_obj.driver_remove("delta_location", 2)
         log("Removed shrinkwrap driver from delta_location.z", "BAKE")
-    except:
+    except RuntimeError:
         pass  # Driver didn't exist
 
     # Apply z_offset from settings instead of resetting to 0
@@ -369,7 +368,7 @@ def remove_shrinkwrap_driver(gp_obj):
         # Fallback to 0 if settings unavailable (e.g., during unregister)
         try:
             gp_obj.delta_location.z = 0.0
-        except:
+        except (AttributeError, RuntimeError):
             pass
 
 
@@ -526,37 +525,6 @@ def _compute_single_frame_offset(gp_obj, scene, frame):
         pass
 
     return 0.0
-
-
-def adjust_path_points_to_mesh(points, scene):
-    """Adjust path points to sit on mesh surface (shrinkwrap effect)."""
-    try:
-        depsgraph = bpy.context.evaluated_depsgraph_get()
-    except (RuntimeError, AttributeError):
-        return points
-
-    adjusted_points = []
-    for pt in points:
-        x, y, z = pt
-
-        # Cast ray straight down from high above
-        ray_origin = Vector((x, y, z + 1000))
-        ray_dir = Vector((0, 0, -1))
-
-        hit, location, normal, index, hit_obj, matrix = scene.ray_cast(
-            depsgraph, ray_origin, ray_dir
-        )
-
-        if hit:
-            # Adjust Z to be on mesh surface + small offset
-            new_z = location.z + SURFACE_OFFSET
-            adjusted_points.append((x, y, new_z))
-        else:
-            # No hit - keep original
-            adjusted_points.append(pt)
-
-    return adjusted_points
-
 
 # ============================================================================
 # MOTION PATH VISUALIZATION HELPERS
@@ -741,7 +709,7 @@ def _extract_keyframe_data(gp_obj, fc_x, fc_y, fc_z, settings):
 
 def get_draw_handlers():
     """Get current draw handler references."""
-    return _draw_handler, _anchor_draw_handler
+    return _draw_handler
 
 
 def _build_onion_batches_for_frame(frame, strokes, z_offset, fill_shader, stroke_shader):
@@ -753,8 +721,8 @@ def _build_onion_batches_for_frame(frame, strokes, z_offset, fill_shader, stroke
     stroke_batches = []
 
     for stroke_data in strokes:
-        points = stroke_data['points']
-        if len(points) < 2:
+        points = stroke_data.get('points')
+        if not points or len(points) < 2:
             continue
 
         # Apply z_offset to points (points are tuples)
@@ -840,6 +808,8 @@ def draw_onion_callback():
 
     try:
         region = bpy.context.region
+        if region is None:
+            return
 
         # PERFORMANCE: Two-pass rendering reduces shader binds from 2N to 2
         # First pass: all fills with fill_shader bound once
@@ -882,6 +852,10 @@ def draw_onion_callback():
                 _onion_batch_cache[cache_key] = _build_onion_batches_for_frame(
                     frame, strokes, z_offset, fill_shader, stroke_shader
                 )
+                # v9.4: FIFO eviction to prevent unbounded cache growth
+                while len(_onion_batch_cache) > _ONION_CACHE_MAX_SIZE:
+                    oldest_key = next(iter(_onion_batch_cache))
+                    del _onion_batch_cache[oldest_key]
 
             cached_batches = _onion_batch_cache[cache_key]
 
@@ -993,125 +967,6 @@ def get_regular_frames(settings, current_frame):
     return frames_to_show
 
 
-def draw_anchor_callback():
-    """
-    GPU draw callback - renders anchor position indicators.
-
-    PERFORMANCE: Uses batch caching to avoid creating GPU batches per anchor
-    on every viewport redraw. Batches are rebuilt only when anchors change.
-    """
-    global _anchor_batch_cache, _anchor_batch_gp, _anchor_batch_dirty, _anchor_batch_frame
-
-    try:
-        scene = bpy.context.scene
-    except (RuntimeError, AttributeError):
-        return
-
-    if not hasattr(scene, 'world_onion'):
-        return
-
-    settings = scene.world_onion
-
-    if not settings.enabled:
-        return
-
-    if not settings.anchor_enabled:
-        return
-
-    # Get active GP object (auto-detect)
-    gp_obj = get_active_gp(bpy.context)
-    if gp_obj is None:
-        return
-
-    current_frame = scene.frame_current
-
-    # Check if GP object or frame changed -> force cache rebuild
-    # Frame change affects which anchor is "current"
-    if _anchor_batch_gp != gp_obj:
-        _anchor_batch_dirty = True
-        _anchor_batch_gp = gp_obj
-    elif _anchor_batch_frame != current_frame:
-        _anchor_batch_dirty = True
-
-    # Rebuild batches if dirty
-    if _anchor_batch_dirty or _anchor_batch_cache is None:
-        # Get all anchor positions
-        anchor_data = get_all_anchor_positions(gp_obj, settings)
-
-        if not anchor_data:
-            _anchor_batch_cache = None
-            _anchor_batch_dirty = False
-            return
-
-        # Build geometry for all anchors at once
-        other_points = []
-        other_lines = []
-        current_points = []
-        current_lines = []
-
-        size = 0.05
-        for pos, is_current in anchor_data:
-            pt_list = current_points if is_current else other_points
-            ln_list = current_lines if is_current else other_lines
-
-            pt_list.append((pos.x, pos.y, pos.z))
-            # Cross lines (3 axes)
-            ln_list.extend([
-                (pos.x - size, pos.y, pos.z), (pos.x + size, pos.y, pos.z),
-                (pos.x, pos.y - size, pos.z), (pos.x, pos.y + size, pos.z),
-                (pos.x, pos.y, pos.z - size), (pos.x, pos.y, pos.z + size),
-            ])
-
-        shader = _get_fill_shader()
-        _anchor_batch_cache = {
-            'other_points': batch_for_shader(shader, 'POINTS', {"pos": other_points}) if other_points else None,
-            'other_lines': batch_for_shader(shader, 'LINES', {"pos": other_lines}) if other_lines else None,
-            'current_points': batch_for_shader(shader, 'POINTS', {"pos": current_points}) if current_points else None,
-            'current_lines': batch_for_shader(shader, 'LINES', {"pos": current_lines}) if current_lines else None,
-        }
-        _anchor_batch_dirty = False
-        _anchor_batch_frame = current_frame
-
-    if _anchor_batch_cache is None:
-        return
-
-    # Set up GPU state
-    shader = _get_fill_shader()
-    gpu.state.blend_set('ALPHA')
-    gpu.state.depth_test_set('LESS_EQUAL')
-    gpu.state.depth_mask_set(False)
-    shader.bind()
-
-    # Draw other anchors (dimmer)
-    other_color = (0.8, 0.6, 0.0, 0.4)
-    if _anchor_batch_cache['other_points']:
-        gpu.state.point_size_set(12.0)
-        shader.uniform_float("color", other_color)
-        _anchor_batch_cache['other_points'].draw(shader)
-    if _anchor_batch_cache['other_lines']:
-        gpu.state.line_width_set(1.0)
-        shader.uniform_float("color", other_color)
-        _anchor_batch_cache['other_lines'].draw(shader)
-
-    # Draw current anchor (bright yellow)
-    current_color = (1.0, 0.9, 0.0, 0.9)
-    if _anchor_batch_cache['current_points']:
-        gpu.state.point_size_set(12.0)
-        shader.uniform_float("color", current_color)
-        _anchor_batch_cache['current_points'].draw(shader)
-    if _anchor_batch_cache['current_lines']:
-        gpu.state.line_width_set(2.0)
-        shader.uniform_float("color", current_color)
-        _anchor_batch_cache['current_lines'].draw(shader)
-
-    # Reset GPU state
-    gpu.state.blend_set('NONE')
-    gpu.state.depth_test_set('NONE')
-    gpu.state.depth_mask_set(True)
-    gpu.state.line_width_set(1.0)
-    gpu.state.point_size_set(1.0)
-
-
 def draw_motion_path_callback():
     """
     GPU draw callback - renders motion path connecting object locations.
@@ -1124,7 +979,7 @@ def draw_motion_path_callback():
     """
     global _motion_path_cache, _motion_path_cache_gp, _motion_path_dirty
     global _motion_path_coords, _motion_path_line_batch, _motion_path_point_batch
-    global _motion_path_spacing_dots_batch, _motion_path_arrows_batch, _motion_path_keyframe_data
+    global _motion_path_arrows_batch, _motion_path_keyframe_data
     global _motion_path_keyframe_circles_batch, _motion_path_inbetween_ticks_batch
 
     try:
@@ -1186,6 +1041,15 @@ def draw_motion_path_callback():
         z_offset = settings.stroke_z_offset
         duration = end_frame - start_frame
 
+        # Get depsgraph for raycasting (needed for shrinkwrap)
+        # Define BEFORE if/else so it's available for timing ticks section too
+        depsgraph = None
+        if settings.depth_interaction_enabled:
+            try:
+                depsgraph = bpy.context.evaluated_depsgraph_get()
+            except (RuntimeError, AttributeError):
+                depsgraph = None
+
         if not fc_x or not fc_y or not fc_z:
             # Fallback to frame_set if F-curves incomplete
             original_frame = scene.frame_current
@@ -1196,39 +1060,81 @@ def draw_motion_path_callback():
                 points.append(pos)
             scene.frame_set(original_frame)
         else:
-            # Sample F-curves at fractional frames - inherently smooth
-            frame_step = duration / MOTION_PATH_SAMPLES if MOTION_PATH_SAMPLES > 0 else 1
+            # Build keyframe list with positions and interpolation type
+            # This handles CONSTANT interpolation by manually lerping for visualization
+            keyframes = []
+            for kp in fc_x.keyframe_points:
+                frame = int(kp.co[0])
+                if start_frame <= frame <= end_frame:
+                    keyframes.append({
+                        'frame': frame,
+                        'x': kp.co[1],  # Direct value from keyframe
+                        'y': fc_y.evaluate(frame),  # Y/Z may have different keyframe structure
+                        'z': fc_z.evaluate(frame),
+                        'interp': kp.interpolation,  # 'CONSTANT', 'BEZIER', 'LINEAR'
+                    })
+            keyframes.sort(key=lambda k: k['frame'])
 
-            for i in range(MOTION_PATH_SAMPLES + 1):
-                f = start_frame + i * frame_step  # Fractional frame value
-                x = fc_x.evaluate(f)
-                y = fc_y.evaluate(f)
-                z = fc_z.evaluate(f)
-
-                pos = Vector((x, y, z))
-
-                # Apply shrinkwrap: interpolate between baked integer frame offsets
-                if settings.depth_interaction_enabled:
-                    floor_f = int(f)
-                    ceil_f = floor_f + 1
-                    t = f - floor_f  # Fractional part
-
-                    off1 = get_baked_offset(floor_f)
-                    off2 = get_baked_offset(ceil_f)
-
-                    if off1 is not None and off2 is not None:
-                        # Lerp between baked offsets
-                        pos.z += off1 + (off2 - off1) * t
-                    elif off1 is not None:
-                        pos.z += off1
-                    elif off2 is not None:
-                        pos.z += off2
-
-                # Always add z_offset to motion path visualization
+            # Helper: apply shrinkwrap raycast to a position
+            def apply_shrinkwrap(pos):
+                if settings.depth_interaction_enabled and depsgraph:
+                    ray_origin = Vector((pos.x, pos.y, pos.z + 1000.0))
+                    ray_dir = Vector((0, 0, -1))
+                    hit, location, normal, index, hit_obj, matrix = scene.ray_cast(
+                        depsgraph, ray_origin, ray_dir
+                    )
+                    if hit and hit_obj != gp_obj:
+                        pos.z = location.z + SURFACE_OFFSET
+                # Apply z_offset
                 if z_offset > 0:
                     pos.z += z_offset
+                return pos
 
-                points.append(pos)
+            # Sample between keyframes, handling constant interpolation specially
+            if len(keyframes) < 2:
+                # Single keyframe or none - just evaluate normally
+                frame_step = duration / MOTION_PATH_SAMPLES if MOTION_PATH_SAMPLES > 0 else 1
+                for i in range(MOTION_PATH_SAMPLES + 1):
+                    f = start_frame + i * frame_step
+                    pos = Vector((fc_x.evaluate(f), fc_y.evaluate(f), fc_z.evaluate(f)))
+                    points.append(apply_shrinkwrap(pos))
+            else:
+                # Multiple keyframes - handle each segment
+                for i, kf in enumerate(keyframes):
+                    if i + 1 >= len(keyframes):
+                        # Last keyframe - add final point
+                        pos = Vector((kf['x'], kf['y'], kf['z']))
+                        points.append(apply_shrinkwrap(pos))
+                        break
+
+                    next_kf = keyframes[i + 1]
+                    segment_frames = next_kf['frame'] - kf['frame']
+
+                    # v9.4: Guard against divide by zero if keyframes at same frame
+                    if segment_frames <= 0:
+                        continue
+
+                    # Distribute samples proportionally across segments
+                    samples_for_segment = max(2, int(MOTION_PATH_SAMPLES * segment_frames / duration))
+
+                    for j in range(samples_for_segment):
+                        t = j / samples_for_segment
+
+                        if kf['interp'] == 'CONSTANT':
+                            # CONSTANT interpolation: manually lerp for visualization
+                            # This shows the visual travel path from A to B
+                            x = kf['x'] + (next_kf['x'] - kf['x']) * t
+                            y = kf['y'] + (next_kf['y'] - kf['y']) * t
+                            z = kf['z'] + (next_kf['z'] - kf['z']) * t
+                        else:
+                            # BEZIER/LINEAR: use evaluate() (works correctly)
+                            f = kf['frame'] + segment_frames * t
+                            x = fc_x.evaluate(f)
+                            y = fc_y.evaluate(f)
+                            z = fc_z.evaluate(f)
+
+                        pos = Vector((x, y, z))
+                        points.append(apply_shrinkwrap(pos))
 
         _motion_path_cache = points
         _motion_path_cache_gp = gp_obj
@@ -1242,114 +1148,116 @@ def draw_motion_path_callback():
         )
         # Points batch uses original unsmoothed positions for keyframe markers
         _motion_path_point_batch = batch_for_shader(
-            _get_fill_shader(), 'POINTS', {"pos": [(p.x, p.y, p.z) for p in points]}
+            _get_point_shader(), 'POINTS', {"pos": [(p.x, p.y, p.z) for p in points]}
         )
 
-        # Build visualization enhancement batches
-        fill_shader = _get_fill_shader()
-
-        # Timing Chart: Keyframe circles + Inbetween ticks
-        # Keyframes are shown as filled circles, inbetweens as perpendicular tick marks
+        # Timing Chart: Keyframe dots + Inbetween dots
+        # Both use 3D point sprites (POINTS primitive) - angle-independent rendering
         # Uses F-curve evaluation to match path exactly (respects Bezier interpolation)
         log(f"SPACING_DOTS: enabled={settings.motion_path_spacing_dots_enabled} coords_len={len(coords)}", "DOTS")
         if settings.motion_path_spacing_dots_enabled and fc_x and fc_x.keyframe_points:
-            tick_length = 0.04  # Fixed length in world units for tick marks
-            circle_radius = 0.03  # Radius for keyframe circles
-            circle_segments = 10  # Number of triangles for circle (triangle fan)
-
-            inbetween_line_coords = []  # Tick marks (LINES)
-            keyframe_circle_coords = []  # Filled circles (TRIS)
+            inbetween_point_coords = []  # 3D dots for inbetweens
+            keyframe_point_coords = []   # 3D dots for keyframes
 
             # Get keyframe frames as a set for O(1) lookup
             keyframe_frames = set(int(kp.co[0]) for kp in fc_x.keyframe_points)
 
-            # For each integer frame, evaluate F-curves directly (matches path exactly)
+            # Build sorted keyframe list for constant interpolation handling
+            kf_list = []
+            for kp in fc_x.keyframe_points:
+                kf_frame = int(kp.co[0])
+                if start_frame <= kf_frame <= end_frame:
+                    kf_list.append({
+                        'frame': kf_frame,
+                        'x': kp.co[1],
+                        'y': fc_y.evaluate(kf_frame),
+                        'z': fc_z.evaluate(kf_frame),
+                        'interp': kp.interpolation,
+                    })
+            kf_list.sort(key=lambda k: k['frame'])
+
+            # Helper: find Z from motion path points (already shrinkwrapped)
+            def get_z_from_motion_path(xy_pos):
+                """Find the nearest motion path point and return its Z value."""
+                if not points:
+                    return xy_pos.z
+                # Find closest point by XY distance
+                best_z = points[0].z
+                best_dist_sq = float('inf')
+                for p in points:
+                    dist_sq = (p.x - xy_pos.x)**2 + (p.y - xy_pos.y)**2
+                    if dist_sq < best_dist_sq:
+                        best_dist_sq = dist_sq
+                        best_z = p.z
+                return best_z
+
+            # Helper: get position for frame, handling constant interpolation
+            def get_position_for_frame(frame):
+                """Get interpolated position for frame, handling constant interp specially."""
+                # Find which keyframe segment this frame is in
+                for i, kf in enumerate(kf_list):
+                    if i + 1 < len(kf_list):
+                        next_kf = kf_list[i + 1]
+                        # v9.4: Guard against degenerate keyframe pairs
+                        if next_kf['frame'] <= kf['frame']:
+                            continue
+                        if kf['frame'] <= frame < next_kf['frame']:
+                            if kf['interp'] == 'CONSTANT':
+                                # Manually lerp for visualization
+                                t = (frame - kf['frame']) / (next_kf['frame'] - kf['frame'])
+                                return Vector((
+                                    kf['x'] + (next_kf['x'] - kf['x']) * t,
+                                    kf['y'] + (next_kf['y'] - kf['y']) * t,
+                                    kf['z'] + (next_kf['z'] - kf['z']) * t,
+                                ))
+                            else:
+                                # BEZIER/LINEAR: use evaluate()
+                                return Vector((fc_x.evaluate(frame), fc_y.evaluate(frame), fc_z.evaluate(frame)))
+                # Fallback to evaluate
+                return Vector((fc_x.evaluate(frame), fc_y.evaluate(frame), fc_z.evaluate(frame)))
+
+            # For each integer frame, get position (handling constant interp)
             for frame in range(start_frame, end_frame + 1):
-                # Evaluate F-curves at this frame - respects Bezier/Linear/Constant interpolation
-                x = fc_x.evaluate(frame)
-                y = fc_y.evaluate(frame)
-                z = fc_z.evaluate(frame)
-                pos = Vector((x, y, z))
+                pos = get_position_for_frame(frame)
 
-                # Apply shrinkwrap if enabled
+                # Get Z from motion path (already shrinkwrapped AND has z_offset applied)
                 if settings.depth_interaction_enabled:
-                    baked_offset = get_baked_offset(frame)
-                    if baked_offset is not None:
-                        pos.z += baked_offset
-
-                # Apply z_offset
-                if z_offset > 0:
-                    pos.z += z_offset
+                    pos.z = get_z_from_motion_path(pos)
+                    # Note: z_offset already included in motion path points, don't apply again
+                else:
+                    # Only apply z_offset when shrinkwrap disabled (motion path didn't apply it)
+                    if z_offset > 0:
+                        pos.z += z_offset
 
                 pos.z += 0.01  # Render in front
 
-                # Calculate tangent by sampling slightly before/after
-                delta = 0.5
-                x_before = fc_x.evaluate(frame - delta)
-                y_before = fc_y.evaluate(frame - delta)
-                x_after = fc_x.evaluate(frame + delta)
-                y_after = fc_y.evaluate(frame + delta)
-                tangent = Vector((x_after - x_before, y_after - y_before, 0))
-                if tangent.length < 0.001:
-                    tangent = Vector((1, 0, 0))
-                tangent = tangent.normalized()
-
                 # Check if this is a keyframe or inbetween
                 if frame in keyframe_frames:
-                    # KEYFRAME: Build filled circle using triangle fan
-                    # Circle lies in XY plane at pos.z
-                    center = (pos.x, pos.y, pos.z)
-                    for seg in range(circle_segments):
-                        angle1 = (seg / circle_segments) * 2 * math.pi
-                        angle2 = ((seg + 1) / circle_segments) * 2 * math.pi
-                        # Triangle: center, edge1, edge2
-                        edge1 = (
-                            pos.x + circle_radius * math.cos(angle1),
-                            pos.y + circle_radius * math.sin(angle1),
-                            pos.z
-                        )
-                        edge2 = (
-                            pos.x + circle_radius * math.cos(angle2),
-                            pos.y + circle_radius * math.sin(angle2),
-                            pos.z
-                        )
-                        keyframe_circle_coords.extend([center, edge1, edge2])
+                    # KEYFRAME: Store position for 3D dot (larger size)
+                    keyframe_point_coords.append((pos.x, pos.y, pos.z))
                 else:
-                    # INBETWEEN: Build perpendicular tick mark
-                    # Perpendicular direction
-                    up = Vector((0, 0, 1))
-                    perp = tangent.cross(up)
-                    if perp.length < 0.001:
-                        perp = Vector((1, 0, 0))
-                    perp = perp.normalized() * tick_length
+                    # INBETWEEN: Store position for 3D dot (smaller size)
+                    inbetween_point_coords.append((pos.x, pos.y, pos.z))
 
-                    p1 = pos - perp
-                    p2 = pos + perp
-                    inbetween_line_coords.append((p1.x, p1.y, p1.z))
-                    inbetween_line_coords.append((p2.x, p2.y, p2.z))
+            # Build separate batches for keyframes and inbetweens (both use POINTS)
+            point_shader = _get_point_shader()
 
-            # Build separate batches for keyframes and inbetweens
-            if keyframe_circle_coords:
+            if keyframe_point_coords:
                 _motion_path_keyframe_circles_batch = batch_for_shader(
-                    fill_shader, 'TRIS', {"pos": keyframe_circle_coords}
+                    point_shader, 'POINTS', {"pos": keyframe_point_coords}
                 )
-                log(f"TIMING: built {len(keyframe_circle_coords)//3} keyframe circle triangles", "DOTS")
+                log(f"TIMING: built {len(keyframe_point_coords)} keyframe dots", "DOTS")
             else:
                 _motion_path_keyframe_circles_batch = None
 
-            if inbetween_line_coords:
-                stroke_shader = _get_stroke_shader()
+            if inbetween_point_coords:
                 _motion_path_inbetween_ticks_batch = batch_for_shader(
-                    stroke_shader, 'LINES', {"pos": inbetween_line_coords}
+                    point_shader, 'POINTS', {"pos": inbetween_point_coords}
                 )
-                log(f"TIMING: built {len(inbetween_line_coords)//2} inbetween ticks", "DOTS")
+                log(f"TIMING: built {len(inbetween_point_coords)} inbetween dots", "DOTS")
             else:
                 _motion_path_inbetween_ticks_batch = None
-
-            # Keep legacy batch for backwards compatibility (will be None)
-            _motion_path_spacing_dots_batch = None
         else:
-            _motion_path_spacing_dots_batch = None
             _motion_path_keyframe_circles_batch = None
             _motion_path_inbetween_ticks_batch = None
 
@@ -1418,81 +1326,91 @@ def draw_motion_path_callback():
             pass  # Context unavailable
         return
 
+    # Check region before proceeding
+    region = bpy.context.region
+    if region is None:
+        return
+
     # Set up GPU state
     gpu.state.blend_set('ALPHA')
     gpu.state.depth_test_set('LESS_EQUAL')
     gpu.state.depth_mask_set(False)
 
-    color = tuple(settings.motion_path_color)
-    region = bpy.context.region
+    try:
+        color = tuple(settings.motion_path_color)
 
-    line_shader = _get_stroke_shader()  # Use cached shader
-    line_shader.bind()  # Bind once
-    line_shader.uniform_float("viewportSize", (region.width, region.height))
-    line_shader.uniform_float("lineWidth", settings.motion_path_width)
-    line_shader.uniform_float("color", color)
+        line_shader = _get_stroke_shader()  # Use cached shader
+        line_shader.bind()  # Bind once
+        line_shader.uniform_float("viewportSize", (region.width, region.height))
+        line_shader.uniform_float("lineWidth", settings.motion_path_width)
+        line_shader.uniform_float("color", color)
 
-    # Draw path using cached batch (no recreation every frame!)
-    _motion_path_line_batch.draw(line_shader)
+        # Draw path using cached batch (no recreation every frame!)
+        _motion_path_line_batch.draw(line_shader)
 
-    # Draw points using cached batch
-    if settings.motion_path_show_points:
-        point_shader = _get_fill_shader()
-        point_shader.bind()
-        gpu.state.point_size_set(8.0)
-        point_shader.uniform_float("color", color)
-        _motion_path_point_batch.draw(point_shader)
+        # Draw points using cached batch
+        if settings.motion_path_show_points:
+            point_shader = _get_point_shader()
+            point_shader.bind()
+            gpu.state.point_size_set(8.0)
+            point_shader.uniform_float("color", color)
+            _motion_path_point_batch.draw(point_shader)
 
-    # Draw visualization enhancements using POLYLINE shader for line width control
-    stroke_shader = _get_stroke_shader()
-    region = bpy.context.region
+        # Draw visualization enhancements using POLYLINE shader for line width control
+        stroke_shader = _get_stroke_shader()
 
-    # Draw Timing Chart: Inbetween ticks first, then keyframe circles on top
-    log(f"DRAW_TIMING: enabled={settings.motion_path_spacing_dots_enabled} ticks={_motion_path_inbetween_ticks_batch is not None} circles={_motion_path_keyframe_circles_batch is not None}", "DOTS")
-    if settings.motion_path_spacing_dots_enabled:
-        gpu.state.depth_test_set('NONE')
-        gpu.state.depth_mask_set(False)
-        gpu.state.blend_set('ALPHA')
+        # Draw Timing Chart: Inbetween ticks first, then keyframe circles on top
+        log(f"DRAW_TIMING: enabled={settings.motion_path_spacing_dots_enabled} ticks={_motion_path_inbetween_ticks_batch is not None} circles={_motion_path_keyframe_circles_batch is not None}", "DOTS")
+        if settings.motion_path_spacing_dots_enabled:
+            # Use LESS_EQUAL depth test so ticks are occluded by mesh (like motion path line)
+            gpu.state.depth_test_set('LESS_EQUAL')
+            gpu.state.depth_mask_set(False)
+            gpu.state.blend_set('ALPHA')
 
-        # Draw inbetween ticks (perpendicular lines) with tick color
-        if _motion_path_inbetween_ticks_batch is not None:
+            # Draw inbetween dots (3D points) with tick color
+            if _motion_path_inbetween_ticks_batch is not None:
+                point_shader = _get_point_shader()
+                point_shader.bind()
+                tick_color = tuple(settings.motion_path_spacing_dots_color)
+                point_shader.uniform_float("color", tick_color)
+                # Point size scaled for visibility (setting is 1-10, points need ~4-40 pixels)
+                gpu.state.point_size_set(settings.motion_path_spacing_dots_size * 4.0)
+                _motion_path_inbetween_ticks_batch.draw(point_shader)
+
+            # Draw keyframe dots (3D points) with keyframe color (on top, larger size)
+            if _motion_path_keyframe_circles_batch is not None:
+                point_shader = _get_point_shader()
+                point_shader.bind()
+                keyframe_color = tuple(settings.motion_path_keyframe_color)
+                point_shader.uniform_float("color", keyframe_color)
+                # Keyframe dots are larger than inbetweens (1.5x size)
+                gpu.state.point_size_set(settings.motion_path_spacing_dots_size * 6.0)
+                _motion_path_keyframe_circles_batch.draw(point_shader)
+
+            gpu.state.depth_test_set('LESS_EQUAL')
+
+        # Draw Direction Arrows (V/chevron)
+        if settings.motion_path_arrows_enabled and _motion_path_arrows_batch is not None:
+            # Use LESS_EQUAL depth test so arrows are occluded by mesh (like motion path)
+            gpu.state.depth_test_set('LESS_EQUAL')
+            gpu.state.blend_set('ALPHA')
+
             stroke_shader.bind()
             stroke_shader.uniform_float("viewportSize", (region.width, region.height))
-            stroke_shader.uniform_float("lineWidth", settings.motion_path_spacing_dots_size)
-            tick_color = tuple(settings.motion_path_spacing_dots_color)
-            stroke_shader.uniform_float("color", tick_color)
-            _motion_path_inbetween_ticks_batch.draw(stroke_shader)
+            # Arrow size setting controls both V size and line thickness
+            stroke_shader.uniform_float("lineWidth", settings.motion_path_arrows_size * 20.0)
+            arrow_color = tuple(settings.motion_path_arrows_color)
+            stroke_shader.uniform_float("color", arrow_color)
+            _motion_path_arrows_batch.draw(stroke_shader)
 
-        # Draw keyframe circles (filled) with keyframe color (on top)
-        if _motion_path_keyframe_circles_batch is not None:
-            fill_shader = _get_fill_shader()
-            fill_shader.bind()
-            keyframe_color = tuple(settings.motion_path_keyframe_color)
-            fill_shader.uniform_float("color", keyframe_color)
-            _motion_path_keyframe_circles_batch.draw(fill_shader)
+            gpu.state.depth_test_set('LESS_EQUAL')
 
-        gpu.state.depth_test_set('LESS_EQUAL')
-
-    # Draw Direction Arrows (V/chevron)
-    if settings.motion_path_arrows_enabled and _motion_path_arrows_batch is not None:
+    finally:
+        # Reset GPU state (always runs, even on exception)
+        gpu.state.blend_set('NONE')
         gpu.state.depth_test_set('NONE')
-        gpu.state.blend_set('ALPHA')
-
-        stroke_shader.bind()
-        stroke_shader.uniform_float("viewportSize", (region.width, region.height))
-        # Arrow size setting controls both V size and line thickness
-        stroke_shader.uniform_float("lineWidth", settings.motion_path_arrows_size * 20.0)
-        arrow_color = tuple(settings.motion_path_arrows_color)
-        stroke_shader.uniform_float("color", arrow_color)
-        _motion_path_arrows_batch.draw(stroke_shader)
-
-        gpu.state.depth_test_set('LESS_EQUAL')
-
-    # Reset GPU state
-    gpu.state.blend_set('NONE')
-    gpu.state.depth_test_set('NONE')
-    gpu.state.depth_mask_set(True)
-    gpu.state.point_size_set(1.0)
+        gpu.state.depth_mask_set(True)
+        gpu.state.point_size_set(1.0)
 
 
 def draw_motion_path_labels_callback():
@@ -1571,17 +1489,12 @@ def draw_motion_path_labels_callback():
 
 def register_draw_handlers():
     """Register GPU draw handlers."""
-    global _draw_handler, _anchor_draw_handler, _motion_path_handler, _motion_path_labels_handler
+    global _draw_handler, _motion_path_handler, _motion_path_labels_handler
     global _motion_path_cache, _motion_path_cache_gp, _motion_path_dirty
 
     if _draw_handler is None:
         _draw_handler = bpy.types.SpaceView3D.draw_handler_add(
             draw_onion_callback, (), 'WINDOW', 'POST_VIEW'
-        )
-
-    if _anchor_draw_handler is None:
-        _anchor_draw_handler = bpy.types.SpaceView3D.draw_handler_add(
-            draw_anchor_callback, (), 'WINDOW', 'POST_VIEW'
         )
 
     if _motion_path_handler is None:
@@ -1603,7 +1516,7 @@ def register_draw_handlers():
 
 def unregister_draw_handlers():
     """Unregister GPU draw handlers."""
-    global _draw_handler, _anchor_draw_handler, _motion_path_handler, _motion_path_labels_handler
+    global _draw_handler, _motion_path_handler, _motion_path_labels_handler
 
     if _draw_handler is not None:
         try:
@@ -1611,13 +1524,6 @@ def unregister_draw_handlers():
         except ValueError:
             pass
         _draw_handler = None
-
-    if _anchor_draw_handler is not None:
-        try:
-            bpy.types.SpaceView3D.draw_handler_remove(_anchor_draw_handler, 'WINDOW')
-        except ValueError:
-            pass
-        _anchor_draw_handler = None
 
     if _motion_path_handler is not None:
         try:
