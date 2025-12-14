@@ -11,13 +11,13 @@ Features:
 - Canvas alignment to cursor
 
 Author: Claude + Sasoon
-Version: 9.1.0
+Version: 9.5.0
 """
 
 bl_info = {
     "name": "World Space Onion Skin",
     "author": "Claude + Sasoon",
-    "version": (9, 1, 0),
+    "version": (9, 5, 0),
     "blender": (4, 5, 0),
     "location": "View3D > Sidebar > Onion",
     "description": "World-space onion skinning for GP storyboarding",

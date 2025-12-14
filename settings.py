@@ -376,10 +376,10 @@ class WorldOnionSettings(bpy.types.PropertyGroup):
         update=update_realtime,
     )
 
-    # Global Z offset for stroke placement
-    stroke_z_offset: bpy.props.FloatProperty(
-        name="Z Offset",
-        description="Push strokes up on global Z to prevent clipping behind mesh",
+    # v9.5: Surface offset - distance along surface normal
+    surface_offset: bpy.props.FloatProperty(
+        name="Surface Offset",
+        description="Distance to offset strokes from mesh surface (along surface normal). Requires Shrinkwrap enabled.",
         default=0.0, min=0.0, max=10.0,
         step=1,  # 0.01 increments
         precision=3,

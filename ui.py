@@ -194,7 +194,7 @@ class WONION_PT_motion_path(bpy.types.Panel):
                 row.label(text="", icon='CHECKMARK')
             else:
                 row.label(text="", icon='ERROR')
-        layout.prop(settings, "stroke_z_offset")
+        layout.prop(settings, "surface_offset")
 
 
 class WONION_PT_anchors(bpy.types.Panel):

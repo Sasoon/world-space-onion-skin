@@ -245,6 +245,7 @@ def _on_depsgraph_update_impl(scene, depsgraph):
 
             # Handle deleted keyframes - remove their anchors
             # A keyframe is truly deleted if it was removed but not moved (no matching add)
+            anchors_deleted = False  # v9.4: Track if we deleted any anchors
             for layer_name, removed_frames in removed_by_layer.items():
                 added_frames = added_by_layer.get(layer_name, [])
                 if len(removed_frames) > len(added_frames):
@@ -255,12 +256,18 @@ def _on_depsgraph_update_impl(scene, depsgraph):
                     num_moved = len(added_frames)
                     for frame in removed_sorted[num_moved:]:
                         remove_anchor_for_frame(gp_obj, layer_name, frame)
+                        anchors_deleted = True
                         log(f"ANCHOR_DELETE: removed anchor for deleted keyframe layer={layer_name} frame={frame}", "ANCHOR")
                 elif layer_name not in added_by_layer:
                     # All keyframes in this layer were deleted (none moved)
                     for frame in removed_frames:
                         remove_anchor_for_frame(gp_obj, layer_name, frame)
+                        anchors_deleted = True
                         log(f"ANCHOR_DELETE: removed anchor for deleted keyframe layer={layer_name} frame={frame}", "ANCHOR")
+
+            # v9.4: Force UI redraw if anchors were deleted (updates "X anchors stored" count)
+            if anchors_deleted:
+                _tag_viewport_redraw()
 
             # Handle new keyframes
             if settings.anchor_enabled:

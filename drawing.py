@@ -40,9 +40,10 @@ _motion_path_labels_handler = None  # POST_PIXEL handler for frame number labels
 _motion_path_keyframe_circles_batch = None  # Filled circles at keyframe positions (TRIS)
 _motion_path_inbetween_ticks_batch = None  # Perpendicular tick marks for inbetween frames (LINES)
 
-# Baked shrinkwrap offsets - computed ONCE when shrinkwrap enabled or animation changes
-# Structure: {frame: z_offset}  - stores the Z offset from raycast
-_baked_shrinkwrap_offsets = {}
+# Baked shrinkwrap data - computed ONCE when shrinkwrap enabled or animation changes
+# Structure: {frame: {'z_offset': float, 'normal': (x, y, z)}}
+# v9.5: Now stores surface normal for normal-based offset (wall runs, ceilings, etc.)
+_baked_shrinkwrap_data = {}
 _baked_offset_valid = False  # True after successful bake
 
 # v9.3: Context-aware driver management
@@ -52,11 +53,12 @@ _driver_setup_pending = False  # True if driver needs setup from next safe conte
 _bake_in_progress = False  # Guard against overlapping bakes
 
 # Onion skin GPU batch cache - CRITICAL for performance near camera
-# Structure: {(frame, z_offset): {'fill_batches': [batch, ...], 'stroke_batches': [batch, ...]}}
-# Batches are keyed by (frame, z_offset) and built once, reused on every redraw
+# Structure: {(frame, offset, normal): {'fill_batches': [batch, ...], 'stroke_batches': [batch, ...]}}
+# Batches are keyed by (frame, offset, normal) and built once, reused on every redraw
 # v9.4: Added size limit to prevent unbounded memory growth
+# v9.5: Cache key now includes surface normal for normal-based offset
 _onion_batch_cache = {}
-_onion_cache_z_offset = None  # Track z_offset to detect changes
+_onion_cache_surface_offset = None  # Track surface_offset to detect changes
 _onion_cache_gp = None  # Track GP object to detect changes
 _ONION_CACHE_MAX_SIZE = 100  # Maximum number of cached batch entries (FIFO eviction)
 
@@ -125,9 +127,9 @@ def invalidate_onion_batch_cache():
     PERFORMANCE (P7): Does NOT clear keyframe cache.
     Call invalidate_keyframe_cache() separately when keyframes change.
     """
-    global _onion_batch_cache, _onion_cache_z_offset, _onion_cache_gp
+    global _onion_batch_cache, _onion_cache_surface_offset, _onion_cache_gp
     _onion_batch_cache = {}
-    _onion_cache_z_offset = None
+    _onion_cache_surface_offset = None
     _onion_cache_gp = None
 
 
@@ -151,7 +153,22 @@ def get_baked_offset(frame):
     """
     if not _baked_offset_valid:
         return None
-    return _baked_shrinkwrap_offsets.get(frame)
+    data = _baked_shrinkwrap_data.get(int(frame))
+    if data is None:
+        return None
+    return data.get('z_offset', 0.0)
+
+
+def get_baked_data(frame):
+    """
+    Get full baked shrinkwrap data (z_offset and normal) for a frame.
+    v9.5: Used for surface-normal-based offset.
+
+    Returns dict with 'z_offset' and 'normal' keys, or None if not baked.
+    """
+    if not _baked_offset_valid:
+        return None
+    return _baked_shrinkwrap_data.get(int(frame))
 
 
 def is_bake_valid():
@@ -214,88 +231,147 @@ def complete_pending_driver_setup(gp_obj):
 def _get_shrinkwrap_offset_for_driver(frame):
     """
     Driver namespace function - called by driver expression.
-    Returns the baked offset for the given frame.
+    Returns the baked Z offset for the given frame.
     This is registered in bpy.app.driver_namespace["shrinkwrap_offset"].
     """
     if not _baked_offset_valid:
         return 0.0
-    return _baked_shrinkwrap_offsets.get(int(frame), 0.0)
+    data = _baked_shrinkwrap_data.get(int(frame))
+    if data is None:
+        return 0.0
+    return data.get('z_offset', 0.0)
+
+
+# v9.5: Surface Normal offset driver functions
+# These return the offset component for each axis based on surface normal
+def _get_surface_offset_x(frame, magnitude):
+    """Return X component of surface normal offset."""
+    if not _baked_offset_valid or magnitude == 0:
+        return 0.0
+    data = _baked_shrinkwrap_data.get(int(frame))
+    if data is None or 'normal' not in data:
+        return 0.0
+    return data['normal'][0] * magnitude
+
+
+def _get_surface_offset_y(frame, magnitude):
+    """Return Y component of surface normal offset."""
+    if not _baked_offset_valid or magnitude == 0:
+        return 0.0
+    data = _baked_shrinkwrap_data.get(int(frame))
+    if data is None or 'normal' not in data:
+        return 0.0
+    return data['normal'][1] * magnitude
+
+
+def _get_surface_offset_z(frame, magnitude):
+    """
+    Return Z component: shrinkwrap offset + surface normal offset.
+    Combines both effects for proper surface tracking.
+    """
+    if not _baked_offset_valid:
+        return magnitude  # Fallback: full offset on Z when no bake
+    data = _baked_shrinkwrap_data.get(int(frame))
+    if data is None:
+        return magnitude  # Fallback: full offset on Z when no data
+    z_offset = data.get('z_offset', 0.0)
+    normal = data.get('normal')
+    if normal is None:
+        return z_offset + magnitude  # Shrinkwrap + fallback Z
+    return z_offset + normal[2] * magnitude
 
 
 def register_driver_namespace():
-    """Register our lookup function in the driver namespace."""
+    """Register our lookup functions in the driver namespace."""
     bpy.app.driver_namespace["shrinkwrap_offset"] = _get_shrinkwrap_offset_for_driver
+    # v9.5: Surface normal offset functions for XYZ drivers
+    bpy.app.driver_namespace["surface_offset_x"] = _get_surface_offset_x
+    bpy.app.driver_namespace["surface_offset_y"] = _get_surface_offset_y
+    bpy.app.driver_namespace["surface_offset_z"] = _get_surface_offset_z
 
 
 def unregister_driver_namespace():
     """Unregister from driver namespace."""
     if "shrinkwrap_offset" in bpy.app.driver_namespace:
         del bpy.app.driver_namespace["shrinkwrap_offset"]
+    # v9.5: Remove surface offset functions
+    for name in ("surface_offset_x", "surface_offset_y", "surface_offset_z"):
+        if name in bpy.app.driver_namespace:
+            del bpy.app.driver_namespace[name]
 
 
 def _setup_shrinkwrap_driver(gp_obj):
     """
-    Add driver on delta_location.z that calls our namespace function.
-    No keyframes needed - just a Python expression!
+    Add drivers on delta_location.x/y/z that call our namespace functions.
+    No keyframes needed - just Python expressions!
 
-    The driver expression 'shrinkwrap_offset(frame)' calls our registered
-    function which looks up the offset from our baked dict.
+    v9.5: Now creates THREE drivers for surface-normal-based offset.
+    The offset is applied along the surface normal direction, not just global Z.
+    This supports wall runs, ceilings, and angled surfaces.
 
     v9.3: This function should ONLY be called from safe contexts.
     Context safety is checked by the caller (bake_shrinkwrap_offsets or
     complete_pending_driver_setup). No deferred timer - we use pending flag instead.
     """
-    # Remove existing driver if present (avoid duplicates)
-    try:
-        gp_obj.driver_remove("delta_location", 2)  # index 2 = Z
-    except RuntimeError:
-        pass  # No driver existed
+    # Remove existing drivers if present (avoid duplicates)
+    for axis_idx in (0, 1, 2):  # X, Y, Z
+        try:
+            gp_obj.driver_remove("delta_location", axis_idx)
+        except RuntimeError:
+            pass  # No driver existed
 
-    # NOTE: Namespace function should be registered at addon load time
-    # (in __init__.py register()), not here. But ensure it exists as safety.
-    if "shrinkwrap_offset" not in bpy.app.driver_namespace:
+    # NOTE: Namespace functions should be registered at addon load time
+    # (in __init__.py register()), not here. But ensure they exist as safety.
+    if "surface_offset_x" not in bpy.app.driver_namespace:
         register_driver_namespace()
 
-    # Add new driver
-    fcurve = gp_obj.driver_add("delta_location", 2)
-    driver = fcurve.driver
-    driver.type = 'SCRIPTED'
+    scene = bpy.context.scene
 
-    # Add frame variable that reads current frame from scene
-    var_frame = driver.variables.new()
-    var_frame.name = "frame"
-    var_frame.type = 'SINGLE_PROP'
-    var_frame.targets[0].id_type = 'SCENE'
-    var_frame.targets[0].id = bpy.context.scene
-    var_frame.targets[0].data_path = "frame_current"
+    # Helper to set up a single axis driver
+    def setup_axis_driver(axis_idx, func_name):
+        fcurve = gp_obj.driver_add("delta_location", axis_idx)
+        driver = fcurve.driver
+        driver.type = 'SCRIPTED'
 
-    # Add z_offset variable that reads stroke_z_offset from settings
-    # This allows the driver to include z_offset in its evaluation
-    var_z_offset = driver.variables.new()
-    var_z_offset.name = "z_offset"
-    var_z_offset.type = 'SINGLE_PROP'
-    var_z_offset.targets[0].id_type = 'SCENE'
-    var_z_offset.targets[0].id = bpy.context.scene
-    var_z_offset.targets[0].data_path = "world_onion.stroke_z_offset"
+        # Add frame variable that reads current frame from scene
+        var_frame = driver.variables.new()
+        var_frame.name = "frame"
+        var_frame.type = 'SINGLE_PROP'
+        var_frame.targets[0].id_type = 'SCENE'
+        var_frame.targets[0].id = scene
+        var_frame.targets[0].data_path = "frame_current"
 
-    # Expression: shrinkwrap offset + z_offset setting
-    # When shrinkwrap is enabled, both offsets are combined
-    driver.expression = "shrinkwrap_offset(frame) + z_offset"
+        # Add offset variable that reads surface_offset from settings
+        var_offset = driver.variables.new()
+        var_offset.name = "offset"
+        var_offset.type = 'SINGLE_PROP'
+        var_offset.targets[0].id_type = 'SCENE'
+        var_offset.targets[0].id = scene
+        var_offset.targets[0].data_path = "world_onion.surface_offset"
 
-    log("Setup driver on delta_location.z with shrinkwrap + z_offset", "BAKE")
+        # Expression: surface_offset_x/y/z(frame, offset)
+        driver.expression = f"{func_name}(frame, offset)"
+
+    # Setup X, Y, Z drivers
+    setup_axis_driver(0, "surface_offset_x")
+    setup_axis_driver(1, "surface_offset_y")
+    setup_axis_driver(2, "surface_offset_z")
+
+    log("Setup drivers on delta_location.xyz with surface normal offset", "BAKE")
 
 
 def _has_shrinkwrap_driver(gp_obj):
     """
-    Check if shrinkwrap driver exists on delta_location.z.
-    Returns True if driver is present, False otherwise.
+    Check if shrinkwrap/surface offset drivers exist on delta_location.
+    v9.5: Now checks for ANY axis driver (XYZ), not just Z.
+    Returns True if any driver is present, False otherwise.
     """
     if gp_obj is None:
         return False
     if gp_obj.animation_data is None:
         return False
     for fc in gp_obj.animation_data.drivers:
-        if fc.data_path == "delta_location" and fc.array_index == 2:
+        if fc.data_path == "delta_location" and fc.array_index in (0, 1, 2):
             return True
     return False
 
@@ -347,36 +423,39 @@ def ensure_shrinkwrap_valid(gp_obj, settings, scene):
 
 def remove_shrinkwrap_driver(gp_obj):
     """
-    Remove the shrinkwrap driver when feature is disabled.
-    Applies stroke_z_offset directly instead of resetting to 0.
+    Remove the shrinkwrap/surface offset drivers when feature is disabled.
+    v9.5: Removes all three axis drivers (XYZ) and resets delta_location.
     """
     if gp_obj is None:
         return
 
-    try:
-        gp_obj.driver_remove("delta_location", 2)
-        log("Removed shrinkwrap driver from delta_location.z", "BAKE")
-    except RuntimeError:
-        pass  # Driver didn't exist
-
-    # Apply z_offset from settings instead of resetting to 0
-    # This ensures z_offset still works when shrinkwrap is disabled
-    try:
-        settings = bpy.context.scene.world_onion
-        gp_obj.delta_location.z = settings.stroke_z_offset
-    except (AttributeError, RuntimeError):
-        # Fallback to 0 if settings unavailable (e.g., during unregister)
+    # Remove all three axis drivers
+    for axis_idx in (0, 1, 2):
         try:
-            gp_obj.delta_location.z = 0.0
-        except (AttributeError, RuntimeError):
-            pass
+            gp_obj.driver_remove("delta_location", axis_idx)
+        except RuntimeError:
+            pass  # Driver didn't exist
+
+    log("Removed surface offset drivers from delta_location.xyz", "BAKE")
+
+    # Reset delta_location to zero
+    # Note: surface_offset is only meaningful with shrinkwrap enabled,
+    # so we reset to 0 when disabled (no manual z_offset fallback)
+    try:
+        gp_obj.delta_location.x = 0.0
+        gp_obj.delta_location.y = 0.0
+        gp_obj.delta_location.z = 0.0
+    except (AttributeError, RuntimeError):
+        pass
 
 
 def bake_shrinkwrap_offsets(gp_obj, settings, scene, setup_driver=True):
     """
-    Pre-compute shrinkwrap Z offsets for ENTIRE animation range.
+    Pre-compute shrinkwrap Z offsets AND surface normals for ENTIRE animation range.
 
     Called when shrinkwrap is enabled or animation changes.
+
+    v9.5: Now captures surface normals for normal-based offset (wall runs, ceilings, etc.)
 
     Args:
         gp_obj: The Grease Pencil object
@@ -389,7 +468,7 @@ def bake_shrinkwrap_offsets(gp_obj, settings, scene, setup_driver=True):
     unsafe, driver setup is marked as pending and will be completed from the
     next safe context (UI callback, operator, or when playback stops).
     """
-    global _baked_shrinkwrap_offsets, _baked_offset_valid, _bake_in_progress, _driver_setup_pending
+    global _baked_shrinkwrap_data, _baked_offset_valid, _bake_in_progress, _driver_setup_pending
 
     # Guard against overlapping bakes (can happen with nested handler calls)
     if _bake_in_progress:
@@ -399,7 +478,7 @@ def bake_shrinkwrap_offsets(gp_obj, settings, scene, setup_driver=True):
     _bake_in_progress = True
 
     try:
-        _baked_shrinkwrap_offsets = {}
+        _baked_shrinkwrap_data = {}
         _baked_offset_valid = False
 
         if not gp_obj:
@@ -407,9 +486,9 @@ def bake_shrinkwrap_offsets(gp_obj, settings, scene, setup_driver=True):
 
         if not gp_obj.animation_data or not gp_obj.animation_data.action:
             # No animation - just compute current frame offset
-            offset = _compute_single_frame_offset(gp_obj, scene, scene.frame_current)
-            if offset is not None:
-                _baked_shrinkwrap_offsets[scene.frame_current] = offset
+            data = _compute_single_frame_offset(gp_obj, scene, scene.frame_current)
+            if data is not None:
+                _baked_shrinkwrap_data[scene.frame_current] = data
                 _baked_offset_valid = True
             # Still need driver setup for single-frame case
             if setup_driver:
@@ -454,12 +533,22 @@ def bake_shrinkwrap_offsets(gp_obj, settings, scene, setup_driver=True):
                     # Offset = mesh_z - fcurve_z + small surface offset
                     # Minimum Z mode: only push UP, never down (preserves jump animations)
                     offset = max(0, (location.z + SURFACE_OFFSET) - z)
-                    _baked_shrinkwrap_offsets[frame] = offset
+                    # v9.5: Store both z_offset AND surface normal
+                    _baked_shrinkwrap_data[frame] = {
+                        'z_offset': offset,
+                        'normal': (normal.x, normal.y, normal.z)
+                    }
                 else:
-                    # No mesh below - zero offset
-                    _baked_shrinkwrap_offsets[frame] = 0.0
+                    # No mesh below - zero offset, default up normal
+                    _baked_shrinkwrap_data[frame] = {
+                        'z_offset': 0.0,
+                        'normal': (0.0, 0.0, 1.0)  # Default to global Z up
+                    }
             except (RuntimeError, AttributeError):
-                _baked_shrinkwrap_offsets[frame] = 0.0
+                _baked_shrinkwrap_data[frame] = {
+                    'z_offset': 0.0,
+                    'normal': (0.0, 0.0, 1.0)
+                }
 
             count += 1
 
@@ -469,8 +558,8 @@ def bake_shrinkwrap_offsets(gp_obj, settings, scene, setup_driver=True):
         invalidate_motion_path()
 
         # DEBUG: Log bake results
-        if _baked_shrinkwrap_offsets:
-            offsets = list(_baked_shrinkwrap_offsets.values())
+        if _baked_shrinkwrap_data:
+            offsets = [d['z_offset'] for d in _baked_shrinkwrap_data.values()]
             offset_range = f"min={min(offsets):.4f} max={max(offsets):.4f}"
         else:
             offset_range = "empty"
@@ -504,7 +593,10 @@ def _handle_driver_setup(gp_obj):
 
 
 def _compute_single_frame_offset(gp_obj, scene, frame):
-    """Compute shrinkwrap offset for a single frame."""
+    """Compute shrinkwrap offset and surface normal for a single frame.
+
+    v9.5: Now returns dict with z_offset and normal for surface-based offset.
+    """
     try:
         depsgraph = bpy.context.evaluated_depsgraph_get()
     except (RuntimeError, AttributeError):
@@ -520,11 +612,18 @@ def _compute_single_frame_offset(gp_obj, scene, frame):
             depsgraph, ray_origin, ray_dir
         )
         if hit and hit_obj != gp_obj:
-            return (location.z + SURFACE_OFFSET) - pos.z
+            return {
+                'z_offset': (location.z + SURFACE_OFFSET) - pos.z,
+                'normal': (normal.x, normal.y, normal.z)
+            }
     except (RuntimeError, AttributeError):
         pass
 
-    return 0.0
+    # Default: no offset, up normal
+    return {
+        'z_offset': 0.0,
+        'normal': (0.0, 0.0, 1.0)
+    }
 
 # ============================================================================
 # MOTION PATH VISUALIZATION HELPERS
@@ -667,7 +766,7 @@ def _extract_keyframe_data(gp_obj, fc_x, fc_y, fc_z, settings):
         return []
 
     keyframe_data = []
-    z_offset = settings.stroke_z_offset
+    offset_magnitude = settings.surface_offset
     depth_enabled = settings.depth_interaction_enabled
 
     # Get all keyframe frame numbers
@@ -680,15 +779,21 @@ def _extract_keyframe_data(gp_obj, fc_x, fc_y, fc_z, settings):
         z = fc_z.evaluate(frame)
         pos = Vector((x, y, z))
 
-        # Apply shrinkwrap offset if enabled
+        # v9.5: Apply shrinkwrap offset + surface normal offset if enabled
         if depth_enabled:
-            baked_offset = get_baked_offset(frame)
-            if baked_offset is not None:
-                pos.z += baked_offset
-
-        # Apply z_offset
-        if z_offset > 0:
-            pos.z += z_offset
+            baked_data = get_baked_data(frame)
+            if baked_data is not None:
+                pos.z += baked_data.get('z_offset', 0.0)
+                # Apply surface_offset along normal
+                if offset_magnitude > 0:
+                    normal = baked_data.get('normal')
+                    if normal:
+                        pos.x += normal[0] * offset_magnitude
+                        pos.y += normal[1] * offset_magnitude
+                        pos.z += normal[2] * offset_magnitude
+        elif offset_magnitude > 0:
+            # Fallback: global Z offset when shrinkwrap disabled
+            pos.z += offset_magnitude
 
         # Compute tangent by sampling before/after
         delta = 0.5
@@ -712,10 +817,13 @@ def get_draw_handlers():
     return _draw_handler
 
 
-def _build_onion_batches_for_frame(frame, strokes, z_offset, fill_shader, stroke_shader):
+def _build_onion_batches_for_frame(frame, strokes, offset_magnitude, normal, fill_shader, stroke_shader):
     """
     Build and cache GPU batches for a single onion skin frame.
     Returns dict with 'fill_batches' and 'stroke_batches' lists.
+
+    v9.5: Now takes offset_magnitude and surface normal.
+    Offset is applied along the normal direction (supports walls, ceilings, etc.)
     """
     fill_batches = []
     stroke_batches = []
@@ -725,8 +833,18 @@ def _build_onion_batches_for_frame(frame, strokes, z_offset, fill_shader, stroke
         if not points or len(points) < 2:
             continue
 
-        # Apply z_offset to points (points are tuples)
-        coords = [(p[0], p[1], p[2] + z_offset) for p in points]
+        # Apply offset along surface normal (v9.5)
+        if normal and offset_magnitude > 0:
+            nx, ny, nz = normal
+            coords = [(p[0] + nx * offset_magnitude,
+                       p[1] + ny * offset_magnitude,
+                       p[2] + nz * offset_magnitude) for p in points]
+        elif offset_magnitude > 0:
+            # Fallback: global Z offset when no normal available
+            coords = [(p[0], p[1], p[2] + offset_magnitude) for p in points]
+        else:
+            # No offset
+            coords = list(points)
 
         # Build fill batch if has fill triangles
         fill_triangles = stroke_data.get('fill_triangles', [])
@@ -750,9 +868,10 @@ def draw_onion_callback():
     Called every viewport redraw.
 
     PERFORMANCE: Uses batch caching to avoid recreating GPU geometry every frame.
-    Batches are cached per (frame, z_offset) and only rebuilt when data changes.
+    Batches are cached per (frame, offset, normal) and only rebuilt when data changes.
+    v9.5: Offset is now applied along surface normal when shrinkwrap is enabled.
     """
-    global _onion_batch_cache, _onion_cache_z_offset, _onion_cache_gp
+    global _onion_batch_cache, _onion_cache_surface_offset, _onion_cache_gp
 
     try:
         scene = bpy.context.scene
@@ -790,13 +909,13 @@ def draw_onion_callback():
         _onion_batch_cache = {}
         _onion_cache_gp = gp_obj
 
-    # Calculate base z_offset (stroke_z_offset setting)
-    base_z_offset = settings.stroke_z_offset if settings.stroke_z_offset > 0 else 0.0
+    # v9.5: Get surface_offset magnitude (used with surface normal direction)
+    base_offset = settings.surface_offset if settings.surface_offset > 0 else 0.0
 
-    # Check if z_offset settings changed -> invalidate batch cache
-    if _onion_cache_z_offset != base_z_offset:
+    # Check if offset settings changed -> invalidate batch cache
+    if _onion_cache_surface_offset != base_offset:
         _onion_batch_cache = {}
-        _onion_cache_z_offset = base_z_offset
+        _onion_cache_surface_offset = base_offset
 
     # Set up GPU state
     stroke_shader = _get_stroke_shader()
@@ -837,20 +956,24 @@ def draw_onion_callback():
             if not strokes:
                 continue
 
-            # Calculate z_offset for this frame
-            z_offset = base_z_offset
+            # v9.5: Get baked data (z_offset + surface normal) for this frame
+            normal = None
+            total_offset = base_offset
             if depth_enabled and bake_valid:
-                baked_offset = get_baked_offset(frame)
-                if baked_offset is not None:
-                    z_offset += baked_offset
+                baked_data = get_baked_data(frame)
+                if baked_data is not None:
+                    total_offset += baked_data.get('z_offset', 0.0)
+                    normal = baked_data.get('normal')
 
-            # Cache key includes frame and z_offset
-            cache_key = (frame, round(z_offset, 4))
+            # v9.5: Cache key includes frame, offset magnitude, and normal
+            # Normal tuple makes unique keys for different surface orientations
+            normal_key = normal if normal else (0.0, 0.0, 1.0)
+            cache_key = (frame, round(total_offset, 4), normal_key)
 
             # Get or build cached batches
             if cache_key not in _onion_batch_cache:
                 _onion_batch_cache[cache_key] = _build_onion_batches_for_frame(
-                    frame, strokes, z_offset, fill_shader, stroke_shader
+                    frame, strokes, total_offset, normal, fill_shader, stroke_shader
                 )
                 # v9.4: FIFO eviction to prevent unbounded cache growth
                 while len(_onion_batch_cache) > _ONION_CACHE_MAX_SIZE:
@@ -1037,8 +1160,8 @@ def draw_motion_path_callback():
         fc_y = fcurves.find('location', index=1)
         fc_z = fcurves.find('location', index=2)
 
-        # Cache z_offset setting for motion path
-        z_offset = settings.stroke_z_offset
+        # v9.5: Cache surface_offset magnitude for motion path
+        offset_magnitude = settings.surface_offset
         duration = end_frame - start_frame
 
         # Get depsgraph for raycasting (needed for shrinkwrap)
@@ -1075,7 +1198,7 @@ def draw_motion_path_callback():
                     })
             keyframes.sort(key=lambda k: k['frame'])
 
-            # Helper: apply shrinkwrap raycast to a position
+            # v9.5: Helper: apply shrinkwrap raycast + surface normal offset
             def apply_shrinkwrap(pos):
                 if settings.depth_interaction_enabled and depsgraph:
                     ray_origin = Vector((pos.x, pos.y, pos.z + 1000.0))
@@ -1085,9 +1208,14 @@ def draw_motion_path_callback():
                     )
                     if hit and hit_obj != gp_obj:
                         pos.z = location.z + SURFACE_OFFSET
-                # Apply z_offset
-                if z_offset > 0:
-                    pos.z += z_offset
+                        # Apply surface_offset along surface normal
+                        if offset_magnitude > 0:
+                            pos.x += normal.x * offset_magnitude
+                            pos.y += normal.y * offset_magnitude
+                            pos.z += normal.z * offset_magnitude
+                elif offset_magnitude > 0:
+                    # Fallback: global Z offset when shrinkwrap disabled
+                    pos.z += offset_magnitude
                 return pos
 
             # Sample between keyframes, handling constant interpolation specially
@@ -1220,14 +1348,14 @@ def draw_motion_path_callback():
             for frame in range(start_frame, end_frame + 1):
                 pos = get_position_for_frame(frame)
 
-                # Get Z from motion path (already shrinkwrapped AND has z_offset applied)
+                # Get Z from motion path (already shrinkwrapped AND has offset applied)
                 if settings.depth_interaction_enabled:
                     pos.z = get_z_from_motion_path(pos)
-                    # Note: z_offset already included in motion path points, don't apply again
+                    # Note: surface_offset already included in motion path points, don't apply again
                 else:
-                    # Only apply z_offset when shrinkwrap disabled (motion path didn't apply it)
-                    if z_offset > 0:
-                        pos.z += z_offset
+                    # Only apply surface_offset when shrinkwrap disabled (motion path didn't apply it)
+                    if offset_magnitude > 0:
+                        pos.z += offset_magnitude
 
                 pos.z += 0.01  # Render in front
 

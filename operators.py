@@ -29,6 +29,11 @@ _cursor_sync_running = False
 # This prevents double-updates which cause jitter
 _last_cursor_synced_frame = None
 
+# v9.4: Track programmatic cursor updates to prevent feedback loop in OBJECT_FOLLOWS mode
+# When we set the cursor programmatically (anchor sync, cursor follows object),
+# we don't want OBJECT_FOLLOWS to create a new keyframe
+_cursor_set_programmatically = False
+
 
 def is_cursor_sync_running():
     """Check if cursor sync modal operator is running."""
@@ -82,6 +87,8 @@ class WONION_OT_cursor_sync(bpy.types.Operator):
     _triggered_cursor_pos = None  # Track which cursor position was triggered
 
     def modal(self, context, event):
+        global _cursor_set_programmatically  # v9.4: Declare once at top of modal
+
         # Check if addon still enabled
         if not hasattr(context.scene, 'world_onion'):
             self.cancel(context)
@@ -135,6 +142,7 @@ class WONION_OT_cursor_sync(bpy.types.Operator):
                         if active_layer:
                             anchor_pos = get_anchor_for_frame(gp_obj, active_layer.name, current_frame)
                             if anchor_pos is not None:
+                                _cursor_set_programmatically = True  # v9.4: Prevent OBJECT_FOLLOWS feedback
                                 context.scene.cursor.location = anchor_pos.copy()
                                 set_last_cursor_synced_frame(current_frame)
                                 log(f"ANCHOR_SYNC_ON_STOP frame={current_frame}", "CURSOR")
@@ -171,6 +179,7 @@ class WONION_OT_cursor_sync(bpy.types.Operator):
                                 # Look up stored anchor for this frame
                                 anchor_pos = get_anchor_for_frame(gp_obj, active_layer.name, current_frame)
                                 if anchor_pos is not None:
+                                    _cursor_set_programmatically = True  # v9.4: Prevent OBJECT_FOLLOWS feedback
                                     context.scene.cursor.location = anchor_pos.copy()
                                     set_last_cursor_synced_frame(current_frame)
                                     log(f"ANCHOR_SYNC frame={current_frame}", "CURSOR")
@@ -187,16 +196,26 @@ class WONION_OT_cursor_sync(bpy.types.Operator):
                     cursor_pos = context.scene.cursor.location
                     # Only update if cursor is not already at object position
                     if (obj_pos - cursor_pos).length > 0.0001:
+                        _cursor_set_programmatically = True  # v9.4: Prevent OBJECT_FOLLOWS feedback
                         context.scene.cursor.location = obj_pos.copy()
 
             # === AUTO-DRAW MODE: Object follows Cursor ===
             # When cursor moves and settles (100ms debounce), move object to cursor
             # Strokes move WITH object (no compensation) - different from Set Anchor operator
+            # v9.4: Only respond to USER cursor movement, not programmatic cursor updates
             if not is_animating and settings.anchor_enabled and settings.anchor_sync_mode == 'OBJECT_FOLLOWS':
                 scene = context.scene
                 current_cursor = scene.cursor.location.copy()
 
-                if self._last_cursor_pos is None:
+                # v9.4: Check if cursor was set programmatically (by anchor sync or CURSOR_FOLLOWS)
+                # If so, update tracking but DON'T create keyframes - prevents feedback loop
+                if _cursor_set_programmatically:
+                    _cursor_set_programmatically = False
+                    self._last_cursor_pos = current_cursor
+                    self._triggered_for_position = True  # Prevent triggering for this position
+                    self._triggered_cursor_pos = current_cursor.copy()
+                    log("OBJECT_FOLLOWS: Skipping - cursor was set programmatically", "CURSOR")
+                elif self._last_cursor_pos is None:
                     self._last_cursor_pos = current_cursor
                 else:
                     cursor_moved = (current_cursor - self._last_cursor_pos).length > 0.001
